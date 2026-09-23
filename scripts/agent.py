@@ -55,6 +55,7 @@ class HRLConfig(BaseModel):
     test_deterministic: bool = True
     test_random_actions: bool = False
     report_per_episode: bool = False
+    report_theme: str | None = None  # None / "random" → pick from viz THEMES
     manager_horizon: int | None = None
 
     train_schedule: Literal["joint", "alternating"] = "joint"

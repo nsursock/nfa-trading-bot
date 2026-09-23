@@ -161,13 +161,24 @@ def test_equity_curve_is_monotonic(tmp_path: Path):
         assert None in xs  # line breaks between episode segments
 
 
+def test_resolve_theme_random_and_explicit():
+    from utils.viz_data import THEMES
+
+    from scripts.report import resolve_theme
+
+    assert resolve_theme("noir") == "noir"
+    assert resolve_theme("random") in THEMES
+    assert resolve_theme(None) in THEMES
+
+
 def test_write_report_pngs(tmp_path: Path):
     path = tmp_path / "ledger.csv"
     _write_ledger(path)
     out = write_report(path, tmp_path, initial_balance=10_000.0, theme_name="retrowave")
-    assert out["breakdown"].exists() and out["breakdown"].stat().st_size > 0
-    assert out["performance"].exists() and out["performance"].stat().st_size > 1000
-    assert out["distributions"].exists() and out["distributions"].stat().st_size > 1000
+    assert out["theme"] == "retrowave"
+    assert Path(out["breakdown"]).exists() and Path(out["breakdown"]).stat().st_size > 0
+    assert Path(out["performance"]).exists() and Path(out["performance"]).stat().st_size > 1000
+    assert Path(out["distributions"]).exists() and Path(out["distributions"]).stat().st_size > 1000
     assert not any(k.startswith("performance_ep") for k in out)
 
 
@@ -181,4 +192,4 @@ def test_write_report_per_episode(tmp_path: Path):
     ep_paths = [p for k, p in out.items() if k.startswith("performance_ep")]
     assert ep_paths
     for p in ep_paths:
-        assert p.exists() and p.stat().st_size > 1000
+        assert Path(p).exists() and Path(p).stat().st_size > 1000

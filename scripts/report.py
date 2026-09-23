@@ -7,7 +7,7 @@ Writes into the run directory:
   - performance_epN.png — optional (``report_per_episode`` / ``--per-episode``)
   - distributions.png — leverage / collateral / direction / exit type
 
-Themes reuse ``utils.viz_data`` (default: retrowave).
+Themes reuse ``utils.viz_data`` (default: random theme each report).
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import random
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -34,6 +35,18 @@ def _theme(name: str):
     from utils.viz_data import theme
 
     return theme(name)
+
+
+def resolve_theme(name: str | None = None) -> str:
+    """Pick a viz theme; ``None`` / ``\"random\"`` → uniform draw from THEMES."""
+    from utils.viz_data import THEMES, theme
+
+    if name is None or name == "random":
+        chosen = random.choice(THEMES)
+        theme(chosen)  # validate
+        return chosen
+    theme(name)  # validate
+    return name
 
 EXIT_TYPES = ("market_close", "take_profit", "stop_loss", "liquidation")
 OPEN_TYPE = "market_open"
@@ -617,12 +630,12 @@ def _apply_theme(fig: go.Figure, th: Theme, title: str) -> None:
 def figure_performance(
     trades: list[Trade],
     initial_balance: float,
-    theme_name: str = "retrowave",
+    theme_name: str | None = None,
     *,
     title: str = "performance",
 ) -> go.Figure:
     """2×2 for one episode (or any single contiguous trade stream)."""
-    th = _theme(theme_name)
+    th = _theme(resolve_theme(theme_name))
     exits = _exits(trades)
     xs, ys, _, dd = equity_and_drawdown(trades, initial_balance)
     ret_x = _monotonic_datetimes([t.datetime for t in exits])
@@ -695,10 +708,10 @@ def figure_performance(
 def figure_performance_aggregate(
     trades: list[Trade],
     initial_balance: float,
-    theme_name: str = "retrowave",
+    theme_name: str | None = None,
 ) -> go.Figure:
     """2×2 across all episodes: mean equity/DD vs event, pooled returns."""
-    th = _theme(theme_name)
+    th = _theme(resolve_theme(theme_name))
     exits = _exits(trades)
     xs, mean_y, min_y, max_y, mean_d = mean_equity_and_drawdown(
         trades, initial_balance,
@@ -810,9 +823,9 @@ def _counts(keys: list[str]) -> tuple[list[str], list[int]]:
 
 def figure_distributions(
     trades: list[Trade],
-    theme_name: str = "retrowave",
+    theme_name: str | None = None,
 ) -> go.Figure:
-    th = _theme(theme_name)
+    th = _theme(resolve_theme(theme_name))
     exits = _exits(trades)
     # Prefer exit trades for distributions; fall back to all non-flat rows.
     sample = exits or [t for t in trades if t.side in ("long", "short")]
@@ -887,14 +900,15 @@ def write_report(
     out_dir: str | Path | None = None,
     *,
     initial_balance: float = 10_000.0,
-    theme_name: str = "retrowave",
+    theme_name: str | None = None,
     per_episode: bool = False,
-) -> dict[str, Path]:
+) -> dict[str, Path | str]:
     """Build breakdown.txt + aggregate performance (+ optional per-ep PNGs)."""
     ledger_path = Path(ledger_path)
     out = Path(out_dir) if out_dir is not None else ledger_path.parent
     out.mkdir(parents=True, exist_ok=True)
 
+    theme_name = resolve_theme(theme_name)
     trades = load_trades(ledger_path)
     breakdown_path = out / "breakdown.txt"
     write_breakdown(trades, breakdown_path, initial_balance=initial_balance)
@@ -908,7 +922,8 @@ def write_report(
         str(dist_path), width=1280, height=900, scale=2,
     )
 
-    paths: dict[str, Path] = {
+    paths: dict[str, Path | str] = {
+        "theme": theme_name,
         "breakdown": breakdown_path,
         "performance": perf_path,
         "distributions": dist_path,
@@ -931,7 +946,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("ledger", help="path to ledger.csv")
     p.add_argument("--out-dir", default=None, help="defaults to ledger directory")
     p.add_argument("--initial-balance", type=float, default=10_000.0)
-    p.add_argument("--theme", default="retrowave", help="utils.viz_data theme name")
+    p.add_argument(
+        "--theme",
+        default=None,
+        help="utils.viz_data theme name (default: random)",
+    )
     p.add_argument(
         "--per-episode",
         action="store_true",

@@ -71,7 +71,7 @@ def run(cfg: HRLConfig) -> dict | None:
             ledger_path,
             run_dir,
             initial_balance=cfg.env.initial_balance,
-            theme_name="retrowave",
+            theme_name=cfg.report_theme,
             per_episode=cfg.report_per_episode,
         )
         if cfg.verbose:
@@ -110,6 +110,11 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Also write performance_epN.png (default: aggregate only)",
     )
+    p.add_argument(
+        "--theme",
+        default=None,
+        help="Report viz theme (default: random from utils.viz_data.THEMES)",
+    )
     args = p.parse_args(argv)
 
     cfg = HRLConfig.from_yaml(args.config)
@@ -122,6 +127,8 @@ def main(argv: list[str] | None = None) -> None:
         updates["train_schedule"] = args.schedule
     if args.report_per_episode is not None:
         updates["report_per_episode"] = True
+    if args.theme is not None:
+        updates["report_theme"] = args.theme
     if updates:
         cfg = cfg.model_copy(update=updates)
 
