@@ -205,6 +205,34 @@ class SAC:
         )
         return self._scale(a)
 
+    def sample_unscaled(self, obs, deterministic=False):
+        """Action in [-1, 1] (buffer / HRL space), not env-scaled."""
+        obs = mx.asarray(obs, dtype=mx.float32)
+        if obs.ndim == 1:
+            obs = obs[None, :]
+        if deterministic:
+            return self.actor.deterministic(obs)
+        return self.actor.sample(obs)[0]
+
+    def store(self, obs, next_obs, action, reward, terminated):
+        self.buffer.add(
+            obs, next_obs, action, reward, terminated.astype(mx.float32)
+        )
+
+    def update(self):
+        """One gradient step if the replay buffer is large enough."""
+        if len(self.buffer) < self.config.batch_size:
+            return None
+        out = self._update()
+        mx.eval(
+            self.actor.parameters(),
+            self.critics.parameters(),
+            self.critics_target.parameters(),
+            self.log_ent_coef,
+            *out,
+        )
+        return out
+
     def _update(self):
         cfg = self.config
         ent_coef = self._ent_coef()

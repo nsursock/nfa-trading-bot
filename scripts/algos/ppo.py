@@ -1,4 +1,8 @@
-"""PPO in Apple MLX, SB3-style. Train: python -m scripts.algos.ppo [--config ...]"""
+"""PPO in Apple MLX, SB3-style. Train: python -m scripts.algos.ppo [--config ...]
+
+Supports discrete (categorical) and continuous (squashed-Gaussian) action spaces,
+selected from ``env.is_discrete``.
+"""
 
 import argparse
 import math
@@ -15,6 +19,17 @@ from pydantic import model_validator
 from scripts.algos.common import (
     BaseAlgoConfig, StatsLogger, explained_variance, make_env, orthogonal_init,
 )
+
+LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0
+
+PPO_HEADER = [
+    "time/iterations", "time/total_timesteps", "time/fps",
+    "time/time_elapsed", "rollout/ep_rew_mean", "rollout/ep_len_mean",
+    "train/approx_kl", "train/clip_fraction", "train/clip_range",
+    "train/entropy_loss", "train/explained_variance",
+    "train/learning_rate", "train/loss", "train/n_updates",
+    "train/policy_gradient_loss", "train/value_loss",
+]
 
 
 class PPOConfig(BaseAlgoConfig):
@@ -33,6 +48,7 @@ class PPOConfig(BaseAlgoConfig):
     target_kl: float | None = None
     net_arch: list[int] = [64, 64]
     activation: Literal["tanh", "relu"] = "tanh"
+    log_std_init: float = -0.5
     total_timesteps: int = 100_000
     env_id: str = "CartPole-v1"
 
@@ -65,8 +81,7 @@ class MLP(nn.Module):
 
 
 class ActorCritic(nn.Module):
-    """Separate actor/critic MLPs. Categorical policy head for discrete
-    actions; a Gaussian head can be added alongside later."""
+    """Categorical policy head for discrete actions."""
 
     def __init__(self, obs_dim, n_actions, net_arch, activation):
         super().__init__()
@@ -80,6 +95,48 @@ class ActorCritic(nn.Module):
         return self.critic(obs).squeeze(-1)
 
 
+class GaussianActorCritic(nn.Module):
+    """Squashed-Gaussian policy for continuous actions in [-1, 1]."""
+
+    def __init__(self, obs_dim, act_dim, net_arch, activation, log_std_init=-0.5):
+        super().__init__()
+        self.actor = MLP(obs_dim, net_arch, act_dim, activation, 0.01)
+        self.critic = MLP(obs_dim, net_arch, 1, activation, 1.0)
+        self.log_std = mx.full((act_dim,), log_std_init, dtype=mx.float32)
+
+    def mean(self, obs):
+        return mx.tanh(self.actor(obs))
+
+    def value(self, obs):
+        return self.critic(obs).squeeze(-1)
+
+    def sample(self, obs):
+        mu = self.mean(obs)
+        log_std = mx.clip(self.log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = mx.exp(log_std)
+        eps = mx.random.normal(mu.shape)
+        u = mu + std * eps
+        a = mx.tanh(u)
+        return a, self._log_prob_from_u(u, mu, log_std)
+
+    def log_prob(self, obs, actions):
+        mu = self.mean(obs)
+        log_std = mx.clip(self.log_std, LOG_STD_MIN, LOG_STD_MAX)
+        a = mx.clip(actions, -0.999999, 0.999999)
+        u = 0.5 * mx.log((1.0 + a) / (1.0 - a))
+        return self._log_prob_from_u(u, mu, log_std)
+
+    @staticmethod
+    def _log_prob_from_u(u, mu, log_std):
+        std = mx.exp(log_std)
+        var = std**2
+        logp_u = (
+            -0.5 * (((u - mu) ** 2) / var + 2.0 * log_std + math.log(2 * math.pi))
+        ).sum(axis=-1)
+        a = mx.tanh(u)
+        return logp_u - mx.log(1.0 - a**2 + 1e-6).sum(axis=-1)
+
+
 def _log_softmax(logits):
     return logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
@@ -90,13 +147,21 @@ class PPO:
         self.env = env
         if config.seed is not None:
             mx.random.seed(config.seed)
-        self.policy = ActorCritic(
-            env.obs_dim, env.n_actions, config.net_arch, config.activation
-        )
+        self.continuous = not getattr(env, "is_discrete", True)
+        if self.continuous:
+            self.policy = GaussianActorCritic(
+                env.obs_dim, env.action_dim, config.net_arch,
+                config.activation, config.log_std_init,
+            )
+        else:
+            self.policy = ActorCritic(
+                env.obs_dim, env.n_actions, config.net_arch, config.activation
+            )
         self.optimizer = optimizers.Adam(
             learning_rate=config.learning_rate, eps=1e-5
         )
         self.ep_info_buffer = deque(maxlen=config.stats_window_size)
+        self._n_updates = 0
 
         loss_and_grad = nn.value_and_grad(self.policy, self._loss_and_aux)
         state = [self.policy.state, self.optimizer.state]
@@ -112,35 +177,63 @@ class PPO:
 
         self._step = _step
 
-        @partial(
-            mx.compile,
-            inputs=[self.policy.state, mx.random.state],
-            outputs=[self.policy.state, mx.random.state],
-        )
-        def _act(obs):
-            logits = self.policy.logits(obs)
-            actions = mx.random.categorical(logits)
-            logp_all = _log_softmax(logits)
-            logp = mx.take_along_axis(
-                logp_all, actions[:, None], axis=1
-            ).squeeze(-1)
-            values = self.policy.value(obs)
-            return actions, logp, values
+        if self.continuous:
+            @partial(
+                mx.compile,
+                inputs=[self.policy.state, mx.random.state],
+                outputs=[self.policy.state, mx.random.state],
+            )
+            def _act(obs):
+                actions, logp = self.policy.sample(obs)
+                values = self.policy.value(obs)
+                return actions, logp, values
 
-        self._act_c = _act
+            self._act_c = _act
+        else:
+            @partial(
+                mx.compile,
+                inputs=[self.policy.state, mx.random.state],
+                outputs=[self.policy.state, mx.random.state],
+            )
+            def _act(obs):
+                logits = self.policy.logits(obs)
+                actions = mx.random.categorical(logits)
+                logp_all = _log_softmax(logits)
+                logp = mx.take_along_axis(
+                    logp_all, actions[:, None], axis=1
+                ).squeeze(-1)
+                values = self.policy.value(obs)
+                return actions, logp, values
 
-    # ---- acting ----
+            self._act_c = _act
+
+    # ---- acting (public hooks for external loops / HRL) ----
+    def act(self, obs, deterministic=False):
+        """Return (action, logp, value). logp is zeros if deterministic."""
+        obs = mx.asarray(obs, dtype=mx.float32)
+        if obs.ndim == 1:
+            obs = obs[None, :]
+        if deterministic:
+            if self.continuous:
+                a = self.policy.mean(obs)
+            else:
+                a = mx.argmax(self.policy.logits(obs), axis=-1)
+            v = self.policy.value(obs)
+            return a, mx.zeros((obs.shape[0],), dtype=mx.float32), v
+        return self._act_c(obs)
+
+    def value(self, obs):
+        obs = mx.asarray(obs, dtype=mx.float32)
+        if obs.ndim == 1:
+            obs = obs[None, :]
+        return self.policy.value(obs)
+
     def _act(self, obs):
         return self._act_c(obs)
 
     def predict(self, obs, deterministic=True):
-        obs = mx.asarray(obs, dtype=mx.float32)
-        if obs.ndim == 1:
-            obs = obs[None, :]
-        logits = self.policy.logits(obs)
-        if deterministic:
-            return mx.argmax(logits, axis=-1)
-        return mx.random.categorical(logits)
+        a, _, _ = self.act(obs, deterministic=deterministic)
+        return a
 
     # ---- rollout ----
     def _collect_rollout(self, obs, last_done):
@@ -153,7 +246,6 @@ class PPO:
             actions, logp, values = self._act(obs)
             res = self.env.step(actions)
 
-            # bootstrap value of truncated episodes (SB3 behavior)
             tv = self.policy.value(res.terminal_obs)
             rewards = res.reward + cfg.gamma * tv * res.truncated.astype(mx.float32)
 
@@ -188,11 +280,15 @@ class PPO:
         last_values = self.policy.value(obs)
         return obs, last_done, (obs_b, act_b, logp_b, val_b, rew_b, start_b), last_values
 
+    def gae(self, val_b, rew_b, start_b, last_values, last_done):
+        """Public GAE for externally collected rollouts (e.g. HRL manager)."""
+        return self._gae(val_b, rew_b, start_b, last_values, last_done)
+
     def _gae(self, val_b, rew_b, start_b, last_values, last_done):
         cfg = self.config
-        n_steps = cfg.n_steps
+        n_steps = val_b.shape[0]
         adv = mx.zeros_like(rew_b)
-        last_gae = mx.zeros((self.env.num_envs,))
+        last_gae = mx.zeros((rew_b.shape[1],))
         for t in reversed(range(n_steps)):
             if t == n_steps - 1:
                 next_non_terminal = 1.0 - last_done.astype(mx.float32)
@@ -211,10 +307,18 @@ class PPO:
     ):
         cfg = self.config
         policy = self.policy
-        logits = policy.logits(obs)
-        logp_all = _log_softmax(logits)
-        new_logp = mx.take_along_axis(logp_all, actions[:, None], axis=1).squeeze(-1)
-        values = policy.value(obs)
+        if self.continuous:
+            new_logp = policy.log_prob(obs, actions)
+            values = policy.value(obs)
+            entropy = -mx.mean(new_logp)
+        else:
+            logits = policy.logits(obs)
+            logp_all = _log_softmax(logits)
+            new_logp = mx.take_along_axis(
+                logp_all, actions[:, None], axis=1
+            ).squeeze(-1)
+            values = policy.value(obs)
+            entropy = -mx.mean(mx.sum(mx.exp(logp_all) * logp_all, axis=-1))
 
         a = adv
         if cfg.normalize_advantage:
@@ -236,7 +340,6 @@ class PPO:
                 mx.maximum((returns - values) ** 2, (returns - v_clipped) ** 2)
             )
 
-        entropy = -mx.mean(mx.sum(mx.exp(logp_all) * logp_all, axis=-1))
         entropy_loss = -entropy
         loss = policy_loss + cfg.ent_coef * entropy_loss + cfg.vf_coef * value_loss
 
@@ -246,12 +349,17 @@ class PPO:
         )
         return loss, (policy_loss, value_loss, entropy_loss, approx_kl, clip_fraction)
 
+    def update_rollout(self, buffer, adv, returns):
+        """Public update from an external (obs, act, logp, val, rew, start) buffer."""
+        return self._update(buffer, adv, returns)
+
     def _update(self, buffer, adv, returns):
         cfg = self.config
         obs_b, act_b, logp_b, val_b, _, _ = buffer
-        n = cfg.n_steps * self.env.num_envs
+        n = obs_b.shape[0] * obs_b.shape[1]
         flat = lambda x: x.reshape(n, *x.shape[2:])
-        obs_f, act_f = flat(obs_b), flat(act_b).astype(mx.int32)
+        obs_f = flat(obs_b)
+        act_f = flat(act_b) if self.continuous else flat(act_b).astype(mx.int32)
         logp_f, val_f = flat(logp_b), flat(val_b)
         adv_f, ret_f = flat(adv), flat(returns)
 
@@ -277,6 +385,7 @@ class PPO:
                 n_updates += 1
             if stop:
                 break
+        self._n_updates += n_updates
         keys = ("loss", "pg", "vf", "ent", "kl", "clip")
         if outs:
             means = mx.mean(mx.stack(outs), axis=0).tolist()
@@ -287,14 +396,7 @@ class PPO:
     # ---- learn ----
     def learn(self, callback=None):
         cfg = self.config
-        header = [
-            "time/iterations", "time/total_timesteps", "time/fps",
-            "time/time_elapsed", "rollout/ep_rew_mean", "rollout/ep_len_mean",
-            "train/approx_kl", "train/clip_fraction", "train/clip_range",
-            "train/entropy_loss", "train/explained_variance",
-            "train/learning_rate", "train/loss", "train/n_updates",
-            "train/policy_gradient_loss", "train/value_loss",
-        ]
+        header = PPO_HEADER
         logger = StatsLogger(
             f"{cfg.log_dir}/stats_ppo_{cfg.env_id}.csv", header, cfg.verbose
         )

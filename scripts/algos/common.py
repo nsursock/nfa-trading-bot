@@ -202,3 +202,26 @@ def explained_variance(y_pred, y_true):
     if var_y < 1e-12:
         return float("nan")
     return 1.0 - mx.var(y_true - y_pred).item() / var_y
+
+
+class DimEnv:
+    """Minimal env stub so algo constructors only need shapes / bounds."""
+
+    def __init__(
+        self,
+        n_envs: int,
+        obs_dim: int,
+        action_dim: int = 1,
+        *,
+        is_discrete: bool = False,
+        n_actions: int | None = None,
+        action_low: float = -1.0,
+        action_high: float = 1.0,
+    ):
+        self.num_envs = n_envs
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.is_discrete = is_discrete
+        self.n_actions = n_actions if n_actions is not None else action_dim
+        self.action_low = action_low
+        self.action_high = action_high

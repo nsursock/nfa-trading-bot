@@ -1,0 +1,94 @@
+# Fast end-to-end HRL smoke config. Override --pair / --mode on the CLI.
+seed: 0
+verbose: 1
+mode: full
+pair: ppo_sac
+log_dir: outputs
+ckpt_dir: outputs/ckpts
+stats_window_size: 20
+
+total_timesteps: 512
+test_episodes: 2
+test_deterministic: false
+# CLI convenience only: undertrained policies stay flat, so random fills the
+# ledger on a full run. Correctness is covered by tests/test_hrl.py (controlled
+# actions, <=10s) — not by this flag.
+test_random_actions: true
+manager_horizon: 4
+train_schedule: joint
+alt_worker_timesteps: 128
+alt_manager_timesteps: 64
+
+manager_net_arch: [32, 32]
+worker_net_arch: [32, 32]
+learning_rate: 3.0e-4
+
+worker_buffer_size: 2048
+worker_learning_starts: 64
+worker_batch_size: 32
+worker_tau: 0.02
+worker_gamma: 0.99
+worker_train_freq: 1
+worker_gradient_steps: 1
+worker_ent_coef: auto
+worker_policy_delay: 2
+worker_target_policy_noise: 0.2
+worker_target_noise_clip: 0.5
+worker_action_noise_std: 0.1
+intrinsic_coef: 0.5
+extrinsic_coef: 1.0
+
+manager_buffer_size: 1024
+manager_learning_starts: 16
+manager_batch_size: 16
+manager_tau: 0.02
+manager_gamma: 0.99
+manager_ent_coef: auto
+
+manager_n_steps: 8
+manager_batch_size_ppo: 8
+manager_n_epochs: 2
+manager_gae_lambda: 0.95
+manager_clip_range: 0.2
+manager_ent_coef_ppo: 0.01
+manager_vf_coef: 0.5
+manager_max_grad_norm: 0.5
+manager_log_std_init: -0.5
+
+env:
+  n_envs: 2
+  n_assets: 2
+  seed: 0
+  low_tf: 5m
+  high_tf: 1h
+  n_low_bars: 128
+  lookback_low: 4
+  lookback_high: 2
+  initial_balance: 10000.0
+  min_leverage: 1.0
+  max_leverage: 10.0
+  min_collateral: 0.05
+  max_collateral: 0.2
+  min_tp: 0.01
+  max_tp: 0.05
+  min_sl: 0.01
+  max_sl: 0.04
+  risk_per_trade: 0.05
+  maintenance_margin: 0.005
+  fee_rate: 0.0004
+  side_deadzone: 0.1
+  liquidation_penalty: 1.0
+  reward_pnl_scale: 1.0
+  reward_dd_penalty: 0.5
+  reward_recovery_bonus: 0.35
+  reward_vol_penalty: 0.05
+  reward_hold_cost: 0.0
+  manager_horizon: 4
+  goal_dim: 4
+  market_mu: 0.0
+  market_sigma: 0.015
+  market_regime: mixed
+  market_dt: 1.0
+  market_n_substeps: 4
+  symbols: [BTCUSDT, ETHUSDT]
+  clock_start: "2024-01-01T00:00:00Z"
