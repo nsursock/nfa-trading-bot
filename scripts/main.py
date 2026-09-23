@@ -2,7 +2,7 @@
 
 Modes:
   train  — learn manager + worker (stats CSV in a timestamped run folder)
-  test   — evaluate; writes trade ledger.csv (test only)
+  test   — evaluate; writes ledger.csv + breakdown/report PNGs
   full   — train then test in the same run folder
 
 Examples:
@@ -20,6 +20,7 @@ import yaml
 
 from scripts.agent import HRLAgent, HRLConfig
 from scripts.env import TradingEnv
+from scripts.report import write_report
 
 
 def make_run_dir(base: str, pair: str, schedule: str) -> str:
@@ -32,6 +33,15 @@ def make_run_dir(base: str, pair: str, schedule: str) -> str:
 def build_agent(cfg: HRLConfig) -> HRLAgent:
     env = TradingEnv(cfg.env)
     return HRLAgent(cfg, env)
+
+
+def make_eval_env(cfg: HRLConfig) -> TradingEnv:
+    """Single-env eval: robustness comes from ``test_episodes``, not ``n_envs``.
+
+    Training keeps vectorized ``n_envs`` for throughput; test always runs one
+    env so the ledger is a clean ep1..epN sequence (no parallel env streams).
+    """
+    return TradingEnv(cfg.env.model_copy(update={"n_envs": 1}))
 
 
 def run(cfg: HRLConfig) -> dict | None:
@@ -48,15 +58,27 @@ def run(cfg: HRLConfig) -> dict | None:
         agent.env.detach_ledger()
         agent.learn()
     if mode in ("test", "full"):
+        # Swap to sequential single-env evaluation (keeps trained weights).
+        if agent.env.num_envs != 1:
+            agent.env = make_eval_env(cfg)
         ledger_path = os.path.join(run_dir, "ledger.csv")
         agent.env.attach_ledger(ledger_path)
         try:
             result = agent.test()
         finally:
             agent.env.detach_ledger()
+        report_paths = write_report(
+            ledger_path,
+            run_dir,
+            initial_balance=cfg.env.initial_balance,
+            theme_name="retrowave",
+        )
         if cfg.verbose:
             print(f"run_dir={run_dir}")
             print(f"ledger={ledger_path}")
+            print(f"test_episodes={cfg.test_episodes} (n_envs=1 for eval)")
+            for k, v in report_paths.items():
+                print(f"{k}={v}")
     elif cfg.verbose:
         print(f"run_dir={run_dir}")
     return result

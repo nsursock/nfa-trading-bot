@@ -218,6 +218,9 @@ def test_hrl_smoke_pairs(tmp_path, pair):
     assert (run_dir / f"stats_manager_{m_algo}.csv").exists()
     assert (run_dir / f"stats_worker_{w_algo}.csv").exists()
     assert (run_dir / "ledger.csv").exists()  # attached in test mode
+    assert (run_dir / "breakdown.txt").exists()
+    assert (run_dir / "performance.png").exists()
+    assert (run_dir / "distributions.png").exists()
     assert (run_dir / "config.yaml").exists()
 
 
