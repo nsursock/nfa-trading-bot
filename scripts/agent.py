@@ -54,6 +54,7 @@ class HRLConfig(BaseModel):
     test_episodes: int = 4
     test_deterministic: bool = True
     test_random_actions: bool = False
+    report_per_episode: bool = False
     manager_horizon: int | None = None
 
     train_schedule: Literal["joint", "alternating"] = "joint"

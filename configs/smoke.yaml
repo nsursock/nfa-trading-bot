@@ -14,6 +14,7 @@ test_deterministic: false
 # ledger on a full run. Correctness is covered by tests/test_hrl.py (controlled
 # actions, <=10s) — not by this flag.
 test_random_actions: true
+report_per_episode: false
 manager_horizon: 4
 train_schedule: joint
 alt_worker_timesteps: 128

@@ -3,7 +3,8 @@
 Writes into the run directory:
   - breakdown.txt  — tables by symbol, episode, leverage, collateral,
                      direction, exit type
-  - performance.png — equity / returns scatter / drawdown / returns hist
+  - performance.png — aggregate 2×2 (mean equity/DD across episodes)
+  - performance_epN.png — optional (``report_per_episode`` / ``--per-episode``)
   - distributions.png — leverage / collateral / direction / exit type
 
 Themes reuse ``utils.viz_data`` (default: retrowave).
@@ -157,45 +158,69 @@ def _monotonic_datetimes(raw_iso: list[str]) -> list[datetime]:
     return out
 
 
+def _trades_by_episode(trades: list[Trade]) -> list[tuple[str, list[Trade]]]:
+    """Group trades into contiguous episode runs, ordered ep1, ep2, …"""
+    order = _episode_order(trades)
+    buckets: dict[str, list[Trade]] = {ep: [] for ep in order}
+    for t in trades:
+        buckets.setdefault(t.episode, []).append(t)
+    return [(ep, buckets[ep]) for ep in order if buckets.get(ep)]
+
+
 def equity_curve(
     trades: list[Trade], initial_balance: float,
-) -> tuple[list[datetime], list[float]]:
-    """Cumulative wealth path across the whole test."""
+) -> tuple[list[datetime | None], list[float | None]]:
+    """Equity path for the given trades (one episode = continuous datetime axis)."""
     xs, ys, _, _ = equity_and_drawdown(trades, initial_balance)
     return xs, ys
 
 
 def equity_and_drawdown(
     trades: list[Trade], initial_balance: float,
-) -> tuple[list[datetime], list[float], list[float], list[float]]:
-    """Cumulative equity + per-episode underwater drawdown.
+) -> tuple[
+    list[datetime | None],
+    list[float | None],
+    list[float | None],
+    list[float | None],
+]:
+    """Equity + underwater DD for trades in ledger order.
 
-    Equity is one continuous bankroll. Drawdown is measured on a fresh
-    ``initial_balance`` each episode (env auto-reset semantics) so a long
-    cumulative decline does not make DD a rescaled copy of equity.
+    Prefer a single episode's trades. Multiple episodes get capital resets and
+    line breaks (``None``) between segments — use ``mean_equity_and_drawdown``
+    for the aggregate overview figure instead.
 
     X values are ledger datetimes, shifted so episode resets stay monotonic.
     """
     bal = float(initial_balance)
-    event_iso: list[str] = []
+    segments: list[
+        tuple[list[str], list[float], list[float], list[float]]
+    ] = []
+    isos: list[str] = []
     ys: list[float] = []
     peaks: list[float] = []
     dds: list[float] = []
-    eq = bal          # cumulative wealth (chart)
-    eq_ep = bal       # episode-local equity (for DD)
-    ep_peak = bal
+    eq = bal
+    peak = bal
     prev_ep: str | None = None
-    # Seed at t0 with starting capital (use first trade clock if present).
-    if trades:
-        event_iso.append(trades[0].datetime)
-        ys.append(bal)
-        peaks.append(bal)
-        dds.append(0.0)
+
+    def _flush() -> None:
+        nonlocal isos, ys, peaks, dds, eq, peak
+        if isos:
+            segments.append((isos, ys, peaks, dds))
+        isos, ys, peaks, dds = [], [], [], []
+        eq, peak = bal, bal
+
     for t in trades:
-        if prev_ep is not None and t.episode != prev_ep:
-            eq_ep = bal
-            ep_peak = bal
+        if prev_ep is None or t.episode != prev_ep:
+            if prev_ep is not None:
+                _flush()
+            isos = [t.datetime]
+            ys = [bal]
+            peaks = [bal]
+            dds = [0.0]
+            eq, peak = bal, bal
         prev_ep = t.episode
+
         if t.type == OPEN_TYPE:
             delta = -t.fees_usdc
         elif t.is_exit and t.pnl_usdc is not None:
@@ -203,16 +228,72 @@ def equity_and_drawdown(
         else:
             continue
         eq += delta
-        eq_ep += delta
-        ep_peak = max(ep_peak, eq_ep)
-        event_iso.append(t.datetime)
+        peak = max(peak, eq)
+        isos.append(t.datetime)
         ys.append(eq)
-        peaks.append(ep_peak)
-        dds.append(
-            (eq_ep - ep_peak) / ep_peak if ep_peak > 1e-12 else 0.0
-        )
-    xs = _monotonic_datetimes(event_iso) if event_iso else []
-    return xs, ys, peaks, dds
+        peaks.append(peak)
+        dds.append((eq - peak) / peak if peak > 1e-12 else 0.0)
+    _flush()
+
+    if not segments:
+        return [], [], [], []
+
+    flat_iso: list[str] = []
+    bounds: list[tuple[int, int]] = []
+    for isos_s, _, _, _ in segments:
+        start = len(flat_iso)
+        flat_iso.extend(isos_s)
+        bounds.append((start, len(flat_iso)))
+    flat_xs = _monotonic_datetimes(flat_iso)
+
+    xs: list[datetime | None] = []
+    out_y: list[float | None] = []
+    out_p: list[float | None] = []
+    out_d: list[float | None] = []
+    for i, ((_, seg_y, seg_p, seg_d), (a, b)) in enumerate(
+        zip(segments, bounds)
+    ):
+        if i > 0:
+            xs.append(None)
+            out_y.append(None)
+            out_p.append(None)
+            out_d.append(None)
+        xs.extend(flat_xs[a:b])
+        out_y.extend(seg_y)
+        out_p.extend(seg_p)
+        out_d.extend(seg_d)
+    return xs, out_y, out_p, out_d
+
+
+def mean_equity_and_drawdown(
+    trades: list[Trade], initial_balance: float,
+) -> tuple[list[int], list[float], list[float], list[float], list[float]]:
+    """Mean equity / DD across episodes, aligned by in-episode event index.
+
+    Returns ``(xs, mean_eq, min_eq, max_eq, mean_dd)``.
+    """
+    curves_y: list[list[float]] = []
+    curves_d: list[list[float]] = []
+    for _, ep_trades in _trades_by_episode(trades):
+        _, ys, _, dds = equity_and_drawdown(ep_trades, initial_balance)
+        curves_y.append([float(y) for y in ys if y is not None])
+        curves_d.append([float(d) for d in dds if d is not None])
+    if not curves_y:
+        return [], [], [], [], []
+    n = max(len(y) for y in curves_y)
+    xs = list(range(n))
+    mean_y: list[float] = []
+    min_y: list[float] = []
+    max_y: list[float] = []
+    mean_d: list[float] = []
+    for i in range(n):
+        yi = [y[i] for y in curves_y if i < len(y)]
+        di = [d[i] for d in curves_d if i < len(d)]
+        mean_y.append(sum(yi) / len(yi))
+        min_y.append(min(yi))
+        max_y.append(max(yi))
+        mean_d.append(sum(di) / len(di) if di else 0.0)
+    return xs, mean_y, min_y, max_y, mean_d
 
 
 def drawdown(equity: list[float]) -> list[float]:
@@ -537,10 +618,13 @@ def figure_performance(
     trades: list[Trade],
     initial_balance: float,
     theme_name: str = "retrowave",
+    *,
+    title: str = "performance",
 ) -> go.Figure:
+    """2×2 for one episode (or any single contiguous trade stream)."""
     th = _theme(theme_name)
     exits = _exits(trades)
-    xs, ys, peaks, dd = equity_and_drawdown(trades, initial_balance)
+    xs, ys, _, dd = equity_and_drawdown(trades, initial_balance)
     ret_x = _monotonic_datetimes([t.datetime for t in exits])
     ret_y = [t.pnl_pct if t.pnl_pct is not None else 0.0 for t in exits]
     ret_colors = [th.up if y >= 0 else th.down for y in ret_y]
@@ -558,8 +642,6 @@ def figure_performance(
         vertical_spacing=0.12,
         horizontal_spacing=0.08,
     )
-    # Cumulative equity only (ep-local peak is for DD, not overlaid here —
-    # different scales: wealth vs fresh-per-ep capital).
     fig.add_trace(
         go.Scatter(
             x=xs, y=ys, mode="lines",
@@ -578,7 +660,9 @@ def figure_performance(
     )
     fig.add_trace(
         go.Scatter(
-            x=xs, y=[100.0 * d for d in dd], mode="lines",
+            x=xs,
+            y=[None if d is None else 100.0 * d for d in dd],
+            mode="lines",
             line=dict(color=th.down, width=2),
             fill="tozeroy",
             fillcolor=_hex_alpha(th.down, 0.35),
@@ -596,12 +680,120 @@ def figure_performance(
         ),
         row=2, col=2,
     )
-    _apply_theme(fig, th, "performance")
+    _apply_theme(fig, th, title)
     fig.update_xaxes(title_text="datetime", row=1, col=1)
     fig.update_yaxes(title_text="USDC", row=1, col=1)
     fig.update_xaxes(title_text="datetime", row=1, col=2)
     fig.update_yaxes(title_text="pnl %", row=1, col=2)
     fig.update_xaxes(title_text="datetime", row=2, col=1)
+    fig.update_yaxes(title_text="dd %", row=2, col=1)
+    fig.update_xaxes(title_text="pnl %", row=2, col=2)
+    fig.update_yaxes(title_text="count", row=2, col=2)
+    return fig
+
+
+def figure_performance_aggregate(
+    trades: list[Trade],
+    initial_balance: float,
+    theme_name: str = "retrowave",
+) -> go.Figure:
+    """2×2 across all episodes: mean equity/DD vs event, pooled returns."""
+    th = _theme(theme_name)
+    exits = _exits(trades)
+    xs, mean_y, min_y, max_y, mean_d = mean_equity_and_drawdown(
+        trades, initial_balance,
+    )
+    n_ep = len(_trades_by_episode(trades))
+    # Overlay exits by in-episode index (chained datetimes look periodic).
+    ep_exit_i: dict[str, int] = defaultdict(int)
+    ret_x: list[int] = []
+    ret_y: list[float] = []
+    ret_colors: list[str] = []
+    for t in exits:
+        ret_x.append(ep_exit_i[t.episode])
+        ep_exit_i[t.episode] += 1
+        y = t.pnl_pct if t.pnl_pct is not None else 0.0
+        ret_y.append(y)
+        ret_colors.append(th.up if y >= 0 else th.down)
+    hist_y = list(ret_y)
+
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=(
+            f"Mean equity ({n_ep} eps)",
+            f"Returns by exit # ({n_ep} eps)",
+            f"Mean drawdown ({n_ep} eps)",
+            "Returns distribution (all)",
+        ),
+        vertical_spacing=0.12,
+        horizontal_spacing=0.08,
+    )
+    if xs:
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=max_y, mode="lines",
+                line=dict(width=0),
+                hoverinfo="skip",
+                showlegend=False,
+                name="max",
+            ),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=min_y, mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor=_hex_alpha(th.accent, 0.18),
+                hoverinfo="skip",
+                showlegend=False,
+                name="min",
+            ),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=mean_y, mode="lines",
+                line=dict(color=th.accent, width=2),
+                name="mean equity",
+            ),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=xs, y=[100.0 * d for d in mean_d], mode="lines",
+                line=dict(color=th.down, width=2),
+                fill="tozeroy",
+                fillcolor=_hex_alpha(th.down, 0.35),
+                name="mean dd",
+            ),
+            row=2, col=1,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=ret_x, y=ret_y, mode="markers",
+            marker=dict(color=ret_colors, size=7, opacity=0.85),
+            name="returns",
+        ),
+        row=1, col=2,
+    )
+    fig.add_trace(
+        go.Histogram(
+            x=hist_y,
+            nbinsx=min(40, max(8, len(hist_y) // 2 or 8)),
+            marker_color=th.volume,
+            opacity=0.9,
+            name="returns_hist",
+        ),
+        row=2, col=2,
+    )
+    _apply_theme(fig, th, "performance · aggregate")
+    fig.update_xaxes(title_text="event", row=1, col=1)
+    fig.update_yaxes(title_text="USDC", row=1, col=1)
+    fig.update_xaxes(title_text="exit #", row=1, col=2)
+    fig.update_yaxes(title_text="pnl %", row=1, col=2)
+    fig.update_xaxes(title_text="event", row=2, col=1)
     fig.update_yaxes(title_text="dd %", row=2, col=1)
     fig.update_xaxes(title_text="pnl %", row=2, col=2)
     fig.update_yaxes(title_text="count", row=2, col=2)
@@ -696,8 +888,9 @@ def write_report(
     *,
     initial_balance: float = 10_000.0,
     theme_name: str = "retrowave",
+    per_episode: bool = False,
 ) -> dict[str, Path]:
-    """Build breakdown.txt + performance/distributions PNGs next to the ledger."""
+    """Build breakdown.txt + aggregate performance (+ optional per-ep PNGs)."""
     ledger_path = Path(ledger_path)
     out = Path(out_dir) if out_dir is not None else ledger_path.parent
     out.mkdir(parents=True, exist_ok=True)
@@ -708,17 +901,29 @@ def write_report(
 
     perf_path = out / "performance.png"
     dist_path = out / "distributions.png"
-    figure_performance(trades, initial_balance, theme_name).write_image(
-        str(perf_path), width=1280, height=900, scale=2,
-    )
+    figure_performance_aggregate(
+        trades, initial_balance, theme_name,
+    ).write_image(str(perf_path), width=1280, height=900, scale=2)
     figure_distributions(trades, theme_name).write_image(
         str(dist_path), width=1280, height=900, scale=2,
     )
-    return {
+
+    paths: dict[str, Path] = {
         "breakdown": breakdown_path,
         "performance": perf_path,
         "distributions": dist_path,
     }
+    if per_episode:
+        for ep, ep_trades in _trades_by_episode(trades):
+            ep_path = out / f"performance_{ep}.png"
+            figure_performance(
+                ep_trades,
+                initial_balance,
+                theme_name,
+                title=f"performance · {ep}",
+            ).write_image(str(ep_path), width=1280, height=900, scale=2)
+            paths[f"performance_{ep}"] = ep_path
+    return paths
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -727,12 +932,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out-dir", default=None, help="defaults to ledger directory")
     p.add_argument("--initial-balance", type=float, default=10_000.0)
     p.add_argument("--theme", default="retrowave", help="utils.viz_data theme name")
+    p.add_argument(
+        "--per-episode",
+        action="store_true",
+        help="Also write performance_epN.png (default: aggregate only)",
+    )
     args = p.parse_args(argv)
     paths = write_report(
         args.ledger,
         args.out_dir,
         initial_balance=args.initial_balance,
         theme_name=args.theme,
+        per_episode=args.per_episode,
     )
     for k, v in paths.items():
         print(f"{k}={v}")

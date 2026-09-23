@@ -72,6 +72,7 @@ def run(cfg: HRLConfig) -> dict | None:
             run_dir,
             initial_balance=cfg.env.initial_balance,
             theme_name="retrowave",
+            per_episode=cfg.report_per_episode,
         )
         if cfg.verbose:
             print(f"run_dir={run_dir}")
@@ -103,6 +104,12 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Override train_schedule (joint=default, alternating)",
     )
+    p.add_argument(
+        "--report-per-episode",
+        action="store_true",
+        default=None,
+        help="Also write performance_epN.png (default: aggregate only)",
+    )
     args = p.parse_args(argv)
 
     cfg = HRLConfig.from_yaml(args.config)
@@ -113,6 +120,8 @@ def main(argv: list[str] | None = None) -> None:
         updates["pair"] = args.pair
     if args.schedule is not None:
         updates["train_schedule"] = args.schedule
+    if args.report_per_episode is not None:
+        updates["report_per_episode"] = True
     if updates:
         cfg = cfg.model_copy(update=updates)
 

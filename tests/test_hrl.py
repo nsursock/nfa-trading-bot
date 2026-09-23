@@ -221,6 +221,7 @@ def test_hrl_smoke_pairs(tmp_path, pair):
     assert (run_dir / "breakdown.txt").exists()
     assert (run_dir / "performance.png").exists()
     assert (run_dir / "distributions.png").exists()
+    assert not list(run_dir.glob("performance_ep*.png"))
     assert (run_dir / "config.yaml").exists()
 
 

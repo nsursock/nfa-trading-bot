@@ -9,8 +9,9 @@ stats_window_size: 100
 
 total_timesteps: 50000
 test_episodes: 8
-test_deterministic: true
+test_deterministic: false
 test_random_actions: false
+report_per_episode: false
 manager_horizon: 12
 train_schedule: joint
 alt_worker_timesteps: 2048

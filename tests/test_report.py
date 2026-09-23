@@ -144,18 +144,21 @@ def test_equity_curve_is_monotonic(tmp_path: Path):
     _write_ledger(path)
     trades = load_trades(path)
     xs, ys, peaks, dds = equity_and_drawdown(trades, 10_000.0)
-    assert xs == sorted(xs)
-    assert all(isinstance(x, datetime) for x in xs)
     assert len(xs) == len(ys) == len(peaks) == len(dds)
-    assert len(set(xs)) == len(xs)
-    assert max(dds) == 0.0
-    assert min(dds) <= 0.0
-    assert min(dds) > -2.0  # sane % of episode capital, not a near-zero peak
-    # With >1 episode, per-ep DD is not a global affine of cumulative equity.
-    if len({t.episode for t in trades}) > 1:
-        gpeak = max(ys)
-        global_dd = [(e - gpeak) / gpeak for e in ys]
-        assert sum(abs(a - b) for a, b in zip(global_dd, dds)) > 1e-3
+    real_x = [x for x in xs if x is not None]
+    real_y = [y for y in ys if y is not None]
+    real_d = [d for d in dds if d is not None]
+    assert all(isinstance(x, datetime) for x in real_x)
+    assert real_x == sorted(real_x)
+    assert len(set(real_x)) == len(real_x)
+    assert max(real_d) == 0.0
+    assert min(real_d) <= 0.0
+    assert min(real_d) > -2.0
+    n_eps = len({t.episode for t in trades})
+    # Each episode run restarts at initial_balance (env auto-reset).
+    assert real_y.count(10_000.0) >= n_eps
+    if n_eps > 1:
+        assert None in xs  # line breaks between episode segments
 
 
 def test_write_report_pngs(tmp_path: Path):
@@ -165,3 +168,17 @@ def test_write_report_pngs(tmp_path: Path):
     assert out["breakdown"].exists() and out["breakdown"].stat().st_size > 0
     assert out["performance"].exists() and out["performance"].stat().st_size > 1000
     assert out["distributions"].exists() and out["distributions"].stat().st_size > 1000
+    assert not any(k.startswith("performance_ep") for k in out)
+
+
+def test_write_report_per_episode(tmp_path: Path):
+    path = tmp_path / "ledger.csv"
+    _write_ledger(path)
+    out = write_report(
+        path, tmp_path, initial_balance=10_000.0, theme_name="retrowave",
+        per_episode=True,
+    )
+    ep_paths = [p for k, p in out.items() if k.startswith("performance_ep")]
+    assert ep_paths
+    for p in ep_paths:
+        assert p.exists() and p.stat().st_size > 1000
