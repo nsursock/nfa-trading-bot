@@ -28,6 +28,7 @@ scripts/
 outputs/            stats_{algo}_{env}.csv written by training runs
 tests/              fast unit / smoke tests (~2 s)
 utils/bench/
+  host.py           swap, memory pressure, smctemp °C, thermal state
   scale.py          n_envs sweep: env FPS and train FPS
   throughput.py     fixed replay ratio: wall time for a fixed transition count
   solve.py          n_envs sweep: time to solve (gymnasium reward thresholds)
@@ -124,7 +125,13 @@ step), `train_fps` (median over `--repeats`, with `train_min`/`train_max`),
 ratio), and the raw per-repeat details in `bench_scale.trials.jsonl`.
 Hyperparameters scale with `n_envs` (PPO: batch_size; SAC/TD3: replayed
 samples by `--replay-scaling` sqrt, batch capped by `--max-batch-size`);
-`--fixed-hparams` keeps the YAML values.
+`--fixed-hparams` keeps the YAML values. During the measured window the run
+also records peak swap (`sysctl vm.swapusage`), the lowest system-wide free
+memory and kernel pressure (`Normal`/`Warn`/`Urgent`/`Critical`), CPU and GPU
+temperature from `smctemp`, and thermal state (`Nominal`/`Fair`/`Serious`/`Critical`).
+Peaks are the worst value across repeats. Sample traces are in the trials
+jsonl. `smctemp` is the SMC reader that works on this Apple Silicon machine;
+`osx-cpu-temp` reports 0°C here.
 
 ```bash
 python -m utils.bench.throughput                 # SAC and TD3 at 1024/2048/4096
@@ -144,9 +151,17 @@ warmup cycles. The default count is eight vector steps of the widest env
 ```bash
 python -m utils.bench.solve                    # time-to-solve, 32/64/128 envs
 python -m utils.bench.solve --budget-mult 4 --seeds 0 1 2
+python -m utils.bench.solve --timesteps 20000000 \
+    --n-envs 128 256 512 1024 2048 --seeds 0 1 2 3 4
 ```
 
 `solve.py` trains until the 100-episode mean return reaches gymnasium's
 `reward_threshold` (CartPole-v1: 475; Pendulum-v1 has none, -200 is used) and
 reports wall time and timesteps to solve, or `solved=no` with the best return
-within the budget. Results go to `outputs/bench_{scale,throughput,solve}.csv`.
+within the budget. Each solved run also records `steps/s` (`tts_steps / tts_s`),
+the transitions consumed per second up to the solution. Per-seed rows go to
+`outputs/bench_solve.csv`. `outputs/bench_solve.summary.csv` aggregates each
+`(algo, env, n_envs)`: seeds solved, and among solved seeds the median, mean,
+standard deviation, and P25/P75 of wall time and transitions, plus the median
+`steps/s`. Scale and throughput results go to
+`outputs/bench_{scale,throughput}.csv`.

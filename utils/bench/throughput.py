@@ -17,7 +17,8 @@ Two training cycles are discarded (compile, and the step that crosses
 `learning_starts`). The clock then runs until exactly `--timesteps` more
 transitions have been collected and learned from. `--timesteps` defaults to
 eight vector steps at the widest env, rounded up to a whole PPO rollout when
-PPO is included.
+PPO is included. The same window records swap, memory pressure, smctemp
+CPU/GPU temperature, and thermal state.
 """
 
 import argparse
@@ -32,6 +33,7 @@ import tempfile
 
 import mlx.core as mx
 
+from utils.bench.host import HOST_COLUMNS, host_suffix, peak_host
 from utils.bench.scale import (
     ALGOS, MeasurementWindow, build_config, format_table, make_agent, write_csv,
 )
@@ -39,7 +41,7 @@ from utils.bench.scale import (
 COLUMNS = [
     "algo", "env", "n_envs", "batch_size", "grad_steps", "buffer_size",
     "timesteps", "wall_s", "transitions/s", "trans/prev", "trans_min", "trans_max",
-    "updates", "samples/step", "repeats",
+    "updates", "samples/step", "repeats", *HOST_COLUMNS,
 ]
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_N_ENVS = [1024, 2048, 4096]
@@ -160,6 +162,7 @@ def summarize(trials):
         "updates": round(statistics.median(t["updates"] for t in training)),
         "samples/step": round(statistics.median(samples), 2),
         "repeats": len(trials),
+        **peak_host(t.get("host") for t in training),
     }
 
 
@@ -222,7 +225,8 @@ def main():
                 train = trial["training"]
                 print(f"    {train['timesteps'] / train['wall_s']:.0f} transitions/s "
                       f"({train['wall_s']:.3f}s, {train['updates']} updates, "
-                      f"{train['samples'] / train['timesteps']:.2f} samples/step)",
+                      f"{train['samples'] / train['timesteps']:.2f} samples/step)"
+                      f"{host_suffix(train)}",
                       flush=True)
 
     rows, previous = [], {}

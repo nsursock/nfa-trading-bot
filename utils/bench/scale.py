@@ -23,6 +23,11 @@ and integer update counts. --fixed-hparams preserves YAML hyperparameters.
 Neither mode promises linear train FPS or measures GPU utilization.
 For a fixed replay ratio and a fixed transition count, use
 utils.bench.throughput.
+
+The measured window also records peak swap, lowest free memory, kernel
+pressure, smctemp CPU/GPU temperature, and thermal state (utils.bench.host).
+Those peaks are the worst reading across repeats. Per-sample traces stay in
+the trials jsonl, including the separate env-only microbenchmark.
 """
 
 import argparse
@@ -43,6 +48,7 @@ from scripts.algos.common import make_env
 from scripts.algos.ppo import PPO, PPOConfig
 from scripts.algos.sac import SAC, SACConfig
 from scripts.algos.td3 import TD3, TD3Config
+from utils.bench.host import HOST_COLUMNS, HostSampler, host_suffix, peak_host
 
 ALGOS = {
     "ppo": (PPOConfig, PPO, "configs/ppo_cartpole.yaml"),
@@ -53,6 +59,7 @@ COLUMNS = [
     "algo", "env", "n_envs", "batch_size", "grad_steps", "env_fps", "train_fps",
     "env/train", "train/prev", "updates/s", "samples/s", "samples/step",
     "train_min", "train_max", "repeats", "train_wall_s", "timesteps", "updates",
+    *HOST_COLUMNS,
 ]
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -78,6 +85,7 @@ class MeasurementWindow:
         self.result = None
         self.warmup_cycles = 0
         self.measured_cycles = 0
+        self._host = None
 
     def __call__(self, steps, updates):
         now = self.clock()
@@ -88,12 +96,15 @@ class MeasurementWindow:
                 return False
             self.synchronize()
             self.baseline = (self.clock(), steps, updates)
+            self._host = HostSampler()
+            self._host.start()
             return False
         start, initial_steps, initial_updates = self.baseline
         self.measured_cycles += 1
         if now - start < self.seconds or steps - initial_steps < self.min_steps:
             return False
         self.synchronize()
+        host, host_samples = self._host.stop() if self._host else ({}, [])
         self.result = {
             "wall_s": self.clock() - start,
             "timesteps": steps - initial_steps,
@@ -102,6 +113,8 @@ class MeasurementWindow:
             "warmup_s": start - self.start,
             "warmup_steps": initial_steps,
             "warmup_updates": initial_updates,
+            "host": host,
+            "host_samples": host_samples,
         }
         return True
 
@@ -230,6 +243,7 @@ def summarize(trials):
         "train_min": round(min(rates)), "train_max": round(max(rates)),
         "repeats": len(trials), "train_wall_s": round(sum(t["wall_s"] for t in training), 3),
         "timesteps": steps, "updates": updates,
+        **peak_host(t.get("host") for t in training),
     }
 
 
@@ -341,7 +355,8 @@ def main():
                 collected[(algo, n)].append(trial)
                 train = trial["training"]
                 print(f"    train {train['timesteps'] / train['wall_s']:.0f} fps "
-                      f"({train['wall_s']:.3f}s measured; {train['updates']} updates)", flush=True)
+                      f"({train['wall_s']:.3f}s measured; {train['updates']} updates)"
+                      f"{host_suffix(train)}", flush=True)
 
     rows, previous = [], {}
     for key in combinations:
