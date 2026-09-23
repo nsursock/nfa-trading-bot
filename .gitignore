@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Training artifacts
+outputs/*
+!outputs/.gitkeep
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Local tool config
+.devin/*.local.json
