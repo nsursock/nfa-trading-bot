@@ -4,6 +4,7 @@ import argparse
 import math
 import time
 from collections import deque
+from functools import partial
 from typing import Literal
 
 import mlx.core as mx
@@ -11,7 +12,8 @@ import mlx.nn as nn
 import mlx.optimizers as optimizers
 
 from scripts.algos.common import (
-    BaseAlgoConfig, MLP, ReplayBuffer, StatsLogger, make_env, polyak_update,
+    BaseAlgoConfig, MLP, ReplayBuffer, StatsLogger, TwinCritics, make_env,
+    polyak_update,
 )
 
 LOG_STD_MIN, LOG_STD_MAX = -20.0, 2.0
@@ -81,17 +83,6 @@ class Actor(nn.Module):
         return mx.tanh(mu)
 
 
-class Critics(nn.Module):
-    def __init__(self, obs_dim, action_dim, net_arch):
-        super().__init__()
-        self.q1 = MLP(obs_dim + action_dim, net_arch, 1, activation="relu")
-        self.q2 = MLP(obs_dim + action_dim, net_arch, 1, activation="relu")
-
-    def __call__(self, obs, action):
-        x = mx.concatenate([obs, action], axis=-1)
-        return self.q1(x).squeeze(-1), self.q2(x).squeeze(-1)
-
-
 class SAC:
     def __init__(self, config: SACConfig, env):
         self.config = config
@@ -100,8 +91,8 @@ class SAC:
             mx.random.seed(config.seed)
         obs_dim, act_dim = env.obs_dim, env.action_dim
         self.actor = Actor(obs_dim, act_dim, config.net_arch)
-        self.critics = Critics(obs_dim, act_dim, config.net_arch)
-        self.critics_target = Critics(obs_dim, act_dim, config.net_arch)
+        self.critics = TwinCritics(obs_dim, act_dim, config.net_arch)
+        self.critics_target = TwinCritics(obs_dim, act_dim, config.net_arch)
         self.critics_target.update(self.critics.parameters())
 
         self.opt_actor = optimizers.Adam(learning_rate=config.learning_rate)
@@ -125,6 +116,75 @@ class SAC:
         self.ep_info_buffer = deque(maxlen=config.stats_window_size)
         self.act_low = env.action_low
         self.act_high = env.action_high
+        self._n_updates = 0
+
+        state = [
+            self.actor.state,
+            self.critics.state,
+            self.critics_target.state,
+            self.opt_critic.state,
+            self.opt_actor.state,
+        ]
+        if self.opt_ent is not None:
+            state += [self.ent_module.state, self.opt_ent.state]
+        state.append(mx.random.state)
+
+        critic_vg = nn.value_and_grad(self.critics, self._critic_loss)
+        actor_vg = nn.value_and_grad(self.actor, self._actor_loss)
+        ent_vg = (
+            nn.value_and_grad(self.ent_module, self._ent_loss)
+            if self.opt_ent is not None
+            else None
+        )
+
+        def _make_step(do_target_update):
+            @partial(mx.compile, inputs=state, outputs=state)
+            def step(obs, next_obs, act, rew, done, ent_coef):
+                critic_loss, cgrads = critic_vg(
+                    obs, next_obs, act, rew, done, ent_coef
+                )
+                self.opt_critic.update(self.critics, cgrads)
+                (actor_loss, logp), agrads = actor_vg(obs, ent_coef)
+                self.opt_actor.update(self.actor, agrads)
+                ent_loss = mx.array(0.0)
+                if ent_vg is not None:
+                    ent_loss, egrads = ent_vg(logp)
+                    self.opt_ent.update(self.ent_module, egrads)
+                if do_target_update:
+                    self.critics_target.update(
+                        polyak_update(
+                            self.critics.parameters(),
+                            self.critics_target.parameters(),
+                            self.config.tau,
+                        )
+                    )
+                return actor_loss, critic_loss, ent_loss
+
+            return step
+
+        self._step = {True: _make_step(True), False: _make_step(False)}
+
+    def _critic_loss(self, obs, next_obs, act, rew, done, ent_coef):
+        cfg = self.config
+        next_a, next_logp = self.actor.sample(next_obs)
+        tq1, tq2 = self.critics_target(next_obs, next_a)
+        target_q = mx.minimum(tq1, tq2) - ent_coef * next_logp
+        y = mx.stop_gradient(
+            rew.squeeze(-1) + (1 - done.squeeze(-1)) * cfg.gamma * target_q
+        )
+        q1, q2 = self.critics(obs, act)
+        return 0.5 * (mx.mean((q1 - y) ** 2) + mx.mean((q2 - y) ** 2))
+
+    def _actor_loss(self, obs, ent_coef):
+        a_pi, logp = self.actor.sample(obs)
+        q1, q2 = self.critics(obs, a_pi)
+        return mx.mean(ent_coef * logp - mx.minimum(q1, q2)), logp
+
+    def _ent_loss(self, logp):
+        return -mx.mean(
+            self.ent_module.log_ent_coef
+            * mx.stop_gradient(logp + self.target_entropy)
+        )
 
     def _ent_coef(self):
         return mx.stop_gradient(mx.exp(self.log_ent_coef))
@@ -151,66 +211,19 @@ class SAC:
 
         obs, next_obs, act, rew, done = self.buffer.sample(cfg.batch_size)
 
-        def critic_loss_fn(critics):
-            next_a, next_logp = self.actor.sample(next_obs)
-            tq1, tq2 = self.critics_target(next_obs, next_a)
-            target_q = mx.minimum(tq1, tq2) - ent_coef * next_logp
-            y = mx.stop_gradient(
-                rew.squeeze(-1) + (1 - done.squeeze(-1)) * cfg.gamma * target_q
-            )
-            q1, q2 = critics(obs, act)
-            return 0.5 * (mx.mean((q1 - y) ** 2) + mx.mean((q2 - y) ** 2))
-
-        critic_loss, cgrads = nn.value_and_grad(self.critics, critic_loss_fn)(
-            self.critics
-        )
-        self.opt_critic.update(self.critics, cgrads)
-
-        def actor_loss_fn(actor):
-            a_pi, logp = actor.sample(obs)
-            q1, q2 = self.critics(obs, a_pi)
-            return mx.mean(ent_coef * logp - mx.minimum(q1, q2))
-
-        actor_loss, agrads = nn.value_and_grad(self.actor, actor_loss_fn)(
-            self.actor
-        )
-        self.opt_actor.update(self.actor, agrads)
-
-        ent_loss = mx.array(0.0)
-        if self.opt_ent is not None:
-            _, logp = self.actor.sample(obs)
-
-            def ent_loss_fn(ec):
-                return -mx.mean(
-                    ec.log_ent_coef
-                    * mx.stop_gradient(logp + self.target_entropy)
-                )
-
-            ent_loss, egrads = nn.value_and_grad(self.ent_module, ent_loss_fn)(
-                self.ent_module
-            )
-            self.opt_ent.update(self.ent_module, egrads)
-            self.log_ent_coef = self.ent_module.log_ent_coef
-
         self._n_updates += 1
-        if self._n_updates % cfg.target_update_interval == 0:
-            self.critics_target.update(
-                polyak_update(
-                    self.critics.parameters(),
-                    self.critics_target.parameters(),
-                    cfg.tau,
-                )
-            )
-        mx.eval(
-            self.actor.parameters(),
-            self.critics.parameters(),
-            self.critics_target.parameters(),
-            self.log_ent_coef,
+        do_target_update = (
+            self._n_updates % cfg.target_update_interval == 0
         )
+        actor_loss, critic_loss, ent_loss = self._step[do_target_update](
+            obs, next_obs, act, rew, done, ent_coef
+        )
+        if self.opt_ent is not None:
+            self.log_ent_coef = self.ent_module.log_ent_coef
         return actor_loss, critic_loss, ent_loss
 
     # ---- learn ----
-    def learn(self):
+    def learn(self, callback=None):
         cfg = self.config
         logger = StatsLogger(
             f"{cfg.log_dir}/stats_sac_{cfg.env_id}.csv", HEADER, cfg.verbose
@@ -232,33 +245,12 @@ class SAC:
             else:
                 action, _ = self.actor.sample(obs)
 
-            next_obs, reward, done, infos = self.env.step(self._scale(action))
-
-            real_done = mx.zeros((n_envs,), dtype=mx.float32)
-            buf_next_obs = next_obs
-            done_list = done.tolist()
-            if any(done_list):
-                rows = []
-                for i, info in enumerate(infos):
-                    if "episode" in info:
-                        self.ep_info_buffer.append(
-                            (info["episode"]["r"], info["episode"]["l"])
-                        )
-                        n_episodes += 1
-                        term_obs = info["terminal_observation"]
-                        buf_next_obs = mx.where(
-                            (mx.arange(n_envs) == i)[:, None],
-                            term_obs[None, :],
-                            buf_next_obs,
-                        )
-                        if not info.get("TimeLimit.truncated", False):
-                            real_done = mx.where(
-                                mx.arange(n_envs) == i,
-                                mx.ones_like(real_done),
-                                real_done,
-                            )
-            self.buffer.add(obs, buf_next_obs, action, reward, real_done)
-            obs = next_obs
+            res = self.env.step(self._scale(action))
+            self.buffer.add(
+                obs, res.terminal_obs, action, res.reward,
+                res.terminated.astype(mx.float32),
+            )
+            obs = res.obs
             num_timesteps += n_envs
 
             if num_timesteps >= cfg.learning_starts and (
@@ -273,11 +265,27 @@ class SAC:
                     acc["actor"].append(al)
                     acc["critic"].append(cl)
                     acc["ent"].append(el)
+                mx.eval(
+                    self.actor.parameters(),
+                    self.critics.parameters(),
+                    self.critics_target.parameters(),
+                    self.log_ent_coef,
+                    *acc["actor"], *acc["critic"], *acc["ent"],
+                )
                 if len(acc["actor"]) >= 64:
                     acc = {
                         k: ([mx.mean(mx.stack(v))] if v else [])
                         for k, v in acc.items()
                     }
+
+            fin = mx.stack([
+                res.done.astype(mx.float32), res.ep_ret,
+                res.ep_len.astype(mx.float32),
+            ]).tolist()
+            for d_, r_, l_ in zip(*fin):
+                if d_:
+                    self.ep_info_buffer.append((r_, int(l_)))
+                    n_episodes += 1
 
             if n_episodes > 0 and n_episodes % cfg.log_interval == 0 and (
                 n_episodes != getattr(self, "_last_logged_ep", 0)
@@ -317,6 +325,8 @@ class SAC:
                     "train/learning_rate": cfg.learning_rate,
                     "train/n_updates": self._n_updates,
                 })
+            if callback is not None and callback(num_timesteps, self._n_updates):
+                break
         logger.close()
         return self
 

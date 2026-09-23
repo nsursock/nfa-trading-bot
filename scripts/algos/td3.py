@@ -3,13 +3,15 @@
 import argparse
 import time
 from collections import deque
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optimizers
 
 from scripts.algos.common import (
-    BaseAlgoConfig, MLP, ReplayBuffer, StatsLogger, make_env, polyak_update,
+    BaseAlgoConfig, MLP, ReplayBuffer, StatsLogger, TwinCritics, make_env,
+    polyak_update,
 )
 
 HEADER = [
@@ -48,17 +50,6 @@ class Actor(nn.Module):
         return self.net(obs)
 
 
-class Critics(nn.Module):
-    def __init__(self, obs_dim, action_dim, net_arch):
-        super().__init__()
-        self.q1 = MLP(obs_dim + action_dim, net_arch, 1, activation="relu")
-        self.q2 = MLP(obs_dim + action_dim, net_arch, 1, activation="relu")
-
-    def __call__(self, obs, action):
-        x = mx.concatenate([obs, action], axis=-1)
-        return self.q1(x).squeeze(-1), self.q2(x).squeeze(-1)
-
-
 class TD3:
     def __init__(self, config: TD3Config, env):
         self.config = config
@@ -69,8 +60,8 @@ class TD3:
         self.actor = Actor(obs_dim, act_dim, config.net_arch)
         self.actor_target = Actor(obs_dim, act_dim, config.net_arch)
         self.actor_target.update(self.actor.parameters())
-        self.critics = Critics(obs_dim, act_dim, config.net_arch)
-        self.critics_target = Critics(obs_dim, act_dim, config.net_arch)
+        self.critics = TwinCritics(obs_dim, act_dim, config.net_arch)
+        self.critics_target = TwinCritics(obs_dim, act_dim, config.net_arch)
         self.critics_target.update(self.critics.parameters())
 
         self.opt_actor = optimizers.Adam(learning_rate=config.learning_rate)
@@ -80,6 +71,68 @@ class TD3:
         self.ep_info_buffer = deque(maxlen=config.stats_window_size)
         self.act_low = env.action_low
         self.act_high = env.action_high
+        self._n_updates = 0
+
+        state = [
+            self.actor.state,
+            self.actor_target.state,
+            self.critics.state,
+            self.critics_target.state,
+            self.opt_critic.state,
+            self.opt_actor.state,
+            mx.random.state,
+        ]
+        critic_vg = nn.value_and_grad(self.critics, self._critic_loss)
+        actor_vg = nn.value_and_grad(self.actor, self._actor_loss)
+
+        def _make_step(do_actor):
+            @partial(mx.compile, inputs=state, outputs=state)
+            def step(obs, next_obs, act, rew, done):
+                critic_loss, cgrads = critic_vg(obs, next_obs, act, rew, done)
+                self.opt_critic.update(self.critics, cgrads)
+                if not do_actor:
+                    return critic_loss
+                actor_loss, agrads = actor_vg(obs)
+                self.opt_actor.update(self.actor, agrads)
+                self.critics_target.update(
+                    polyak_update(
+                        self.critics.parameters(),
+                        self.critics_target.parameters(),
+                        self.config.tau,
+                    )
+                )
+                self.actor_target.update(
+                    polyak_update(
+                        self.actor.parameters(),
+                        self.actor_target.parameters(),
+                        self.config.tau,
+                    )
+                )
+                return actor_loss, critic_loss
+
+            return step
+
+        self._step = {True: _make_step(True), False: _make_step(False)}
+
+    def _critic_loss(self, obs, next_obs, act, rew, done):
+        cfg = self.config
+        noise = mx.clip(
+            mx.random.normal(act.shape) * cfg.target_policy_noise,
+            -cfg.target_noise_clip,
+            cfg.target_noise_clip,
+        )
+        next_a = mx.clip(self.actor_target(next_obs) + noise, -1.0, 1.0)
+        tq1, tq2 = self.critics_target(next_obs, next_a)
+        y = mx.stop_gradient(
+            rew.squeeze(-1)
+            + (1 - done.squeeze(-1)) * cfg.gamma * mx.minimum(tq1, tq2)
+        )
+        q1, q2 = self.critics(obs, act)
+        return mx.mean((q1 - y) ** 2) + mx.mean((q2 - y) ** 2)
+
+    def _actor_loss(self, obs):
+        q1, _ = self.critics(obs, self.actor(obs))
+        return -mx.mean(q1)
 
     def _scale(self, a):
         return a * (self.act_high - self.act_low) / 2 + (
@@ -100,60 +153,17 @@ class TD3:
         cfg = self.config
         obs, next_obs, act, rew, done = self.buffer.sample(cfg.batch_size)
 
-        def critic_loss_fn(critics):
-            noise = mx.clip(
-                mx.random.normal(act.shape) * cfg.target_policy_noise,
-                -cfg.target_noise_clip,
-                cfg.target_noise_clip,
-            )
-            next_a = mx.clip(self.actor_target(next_obs) + noise, -1.0, 1.0)
-            tq1, tq2 = self.critics_target(next_obs, next_a)
-            y = mx.stop_gradient(
-                rew.squeeze(-1)
-                + (1 - done.squeeze(-1)) * cfg.gamma * mx.minimum(tq1, tq2)
-            )
-            q1, q2 = critics(obs, act)
-            return mx.mean((q1 - y) ** 2) + mx.mean((q2 - y) ** 2)
-
-        critic_loss, cgrads = nn.value_and_grad(self.critics, critic_loss_fn)(
-            self.critics
-        )
-        self.opt_critic.update(self.critics, cgrads)
-
         self._n_updates += 1
-        actor_loss = None
         if self._n_updates % cfg.policy_delay == 0:
-            def actor_loss_fn(actor):
-                q1, _ = self.critics(obs, actor(obs))
-                return -mx.mean(q1)
-
-            actor_loss, agrads = nn.value_and_grad(self.actor, actor_loss_fn)(
-                self.actor
+            actor_loss, critic_loss = self._step[True](
+                obs, next_obs, act, rew, done
             )
-            self.opt_actor.update(self.actor, agrads)
-            self.critics_target.update(
-                polyak_update(
-                    self.critics.parameters(),
-                    self.critics_target.parameters(),
-                    cfg.tau,
-                )
-            )
-            self.actor_target.update(
-                polyak_update(
-                    self.actor.parameters(),
-                    self.actor_target.parameters(),
-                    cfg.tau,
-                )
-            )
-        mx.eval(
-            self.actor.parameters(),
-            self.critics.parameters(),
-            self.critics_target.parameters(),
-            self.actor_target.parameters(),
-        )
+        else:
+            critic_loss = self._step[False](obs, next_obs, act, rew, done)
+            actor_loss = None
         return actor_loss, critic_loss
 
-    def learn(self):
+    def learn(self, callback=None):
         cfg = self.config
         logger = StatsLogger(
             f"{cfg.log_dir}/stats_td3_{cfg.env_id}.csv", HEADER, cfg.verbose
@@ -177,31 +187,12 @@ class TD3:
                 ) * cfg.action_noise_std
                 action = mx.clip(action, -1.0, 1.0)
 
-            next_obs, reward, done, infos = self.env.step(self._scale(action))
-
-            real_done = mx.zeros((n_envs,), dtype=mx.float32)
-            buf_next_obs = next_obs
-            done_list = done.tolist()
-            if any(done_list):
-                for i, info in enumerate(infos):
-                    if "episode" in info:
-                        self.ep_info_buffer.append(
-                            (info["episode"]["r"], info["episode"]["l"])
-                        )
-                        n_episodes += 1
-                        buf_next_obs = mx.where(
-                            (mx.arange(n_envs) == i)[:, None],
-                            info["terminal_observation"][None, :],
-                            buf_next_obs,
-                        )
-                        if not info.get("TimeLimit.truncated", False):
-                            real_done = mx.where(
-                                mx.arange(n_envs) == i,
-                                mx.ones_like(real_done),
-                                real_done,
-                            )
-            self.buffer.add(obs, buf_next_obs, action, reward, real_done)
-            obs = next_obs
+            res = self.env.step(self._scale(action))
+            self.buffer.add(
+                obs, res.terminal_obs, action, res.reward,
+                res.terminated.astype(mx.float32),
+            )
+            obs = res.obs
             num_timesteps += n_envs
 
             if num_timesteps >= cfg.learning_starts and (
@@ -216,11 +207,27 @@ class TD3:
                     if al is not None:
                         acc["actor"].append(al)
                     acc["critic"].append(cl)
+                mx.eval(
+                    self.actor.parameters(),
+                    self.critics.parameters(),
+                    self.critics_target.parameters(),
+                    self.actor_target.parameters(),
+                    *acc["actor"], *acc["critic"],
+                )
                 if len(acc["critic"]) >= 64:
                     acc = {
                         k: ([mx.mean(mx.stack(v))] if v else [])
                         for k, v in acc.items()
                     }
+
+            fin = mx.stack([
+                res.done.astype(mx.float32), res.ep_ret,
+                res.ep_len.astype(mx.float32),
+            ]).tolist()
+            for d_, r_, l_ in zip(*fin):
+                if d_:
+                    self.ep_info_buffer.append((r_, int(l_)))
+                    n_episodes += 1
 
             if n_episodes > 0 and n_episodes % cfg.log_interval == 0 and (
                 n_episodes != getattr(self, "_last_logged_ep", 0)
@@ -253,6 +260,8 @@ class TD3:
                     "train/learning_rate": cfg.learning_rate,
                     "train/n_updates": self._n_updates,
                 })
+            if callback is not None and callback(num_timesteps, self._n_updates):
+                break
         logger.close()
         return self
 

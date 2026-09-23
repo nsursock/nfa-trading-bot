@@ -1,10 +1,12 @@
 """Vectorized CartPole-v1 environment in pure MLX.
 
 Reproduces gymnasium's CartPole-v1 dynamics (Euler integration) with
-SB3 VecEnv semantics: auto-reset on done, episode stats in infos.
+SB3 VecEnv semantics: auto-reset on done, episode stats in StepResult.
 """
 
 import mlx.core as mx
+
+from scripts.envs.base import StepResult
 
 
 class CartPoleEnv:
@@ -32,29 +34,24 @@ class CartPoleEnv:
         self.steps = mx.zeros((n_envs,), dtype=mx.int32)
         self._ep_ret = mx.zeros((n_envs,))
         self._ep_len = mx.zeros((n_envs,), dtype=mx.int32)
+        self._step_fn = mx.compile(self._physics)
 
     def _split_key(self):
         self._key, sub = mx.random.split(self._key)
         return sub
 
-    def _sample_state(self, n):
+    def _sample_state(self, n, key=None):
         return mx.random.uniform(
-            low=-0.05, high=0.05, shape=(n, 4), key=self._split_key()
+            low=-0.05, high=0.05, shape=(n, 4),
+            key=key if key is not None else self._split_key(),
         ).astype(mx.float32)
 
-    def reset(self):
-        self.state = self._sample_state(self.num_envs)
-        self.steps = mx.zeros((self.num_envs,), dtype=mx.int32)
-        self._ep_ret = mx.zeros((self.num_envs,))
-        self._ep_len = mx.zeros((self.num_envs,), dtype=mx.int32)
-        return self.state
-
-    def step(self, actions):
+    def _physics(self, state, steps, ep_ret, ep_len, actions, key):
         x, x_dot, theta, theta_dot = (
-            self.state[:, 0],
-            self.state[:, 1],
-            self.state[:, 2],
-            self.state[:, 3],
+            state[:, 0],
+            state[:, 1],
+            state[:, 2],
+            state[:, 3],
         )
 
         force = mx.where(actions == 1, self.force_mag, -self.force_mag)
@@ -73,44 +70,55 @@ class CartPoleEnv:
         theta_dot = theta_dot + self.tau * thetaacc
 
         new_state = mx.stack([x, x_dot, theta, theta_dot], axis=1).astype(mx.float32)
-        self.steps = self.steps + 1
+        steps = steps + 1
 
         terminated = (mx.abs(x) > self.x_threshold) | (
             mx.abs(theta) > self.theta_threshold_radians
         )
-        truncated = self.steps >= self.max_episode_steps
+        truncated = (steps >= self.max_episode_steps) & ~terminated
         done = terminated | truncated
 
         reward = mx.ones((self.num_envs,), dtype=mx.float32)
-        self._ep_ret = self._ep_ret + reward
-        self._ep_len = self._ep_len + 1
-
-        done_list = done.tolist()
-        ep_ret = self._ep_ret.tolist()
-        ep_len = self._ep_len.tolist()
-        term_list = terminated.tolist()
-        trunc_list = truncated.tolist()
-
-        infos = []
-        for i in range(self.num_envs):
-            info = {}
-            if done_list[i]:
-                info["episode"] = {"r": float(ep_ret[i]), "l": int(ep_len[i])}
-                info["terminal_observation"] = new_state[i]
-                info["TimeLimit.truncated"] = bool(trunc_list[i]) and not bool(
-                    term_list[i]
-                )
-            infos.append(info)
+        ep_ret = ep_ret + reward
+        ep_len = ep_len + 1
+        res_ret = mx.where(done, ep_ret, mx.zeros_like(ep_ret))
+        res_len = mx.where(done, ep_len, mx.zeros_like(ep_len))
 
         # Auto-reset finished envs (SB3 VecEnv semantics)
-        if any(done_list):
-            resets = self._sample_state(self.num_envs)
-            mask = done[:, None]
-            self.state = mx.where(mask, resets, new_state)
-            self.steps = mx.where(done, mx.zeros_like(self.steps), self.steps)
-            self._ep_ret = mx.where(done, mx.zeros_like(self._ep_ret), self._ep_ret)
-            self._ep_len = mx.where(done, mx.zeros_like(self._ep_len), self._ep_len)
-        else:
-            self.state = new_state
+        resets = self._sample_state(self.num_envs, key)
+        state = mx.where(done[:, None], resets, new_state)
+        steps = mx.where(done, mx.zeros_like(steps), steps)
+        ep_ret = mx.where(done, mx.zeros_like(ep_ret), ep_ret)
+        ep_len = mx.where(done, mx.zeros_like(ep_len), ep_len)
 
-        return self.state, reward, done, infos
+        return (
+            state, steps, ep_ret, ep_len,
+            reward, done, terminated, truncated, new_state, res_ret, res_len,
+        )
+
+    def reset(self):
+        self.state = self._sample_state(self.num_envs)
+        self.steps = mx.zeros((self.num_envs,), dtype=mx.int32)
+        self._ep_ret = mx.zeros((self.num_envs,))
+        self._ep_len = mx.zeros((self.num_envs,), dtype=mx.int32)
+        return self.state
+
+    def step(self, actions):
+        self._key, sub = mx.random.split(self._key)
+        (
+            self.state, self.steps, self._ep_ret, self._ep_len,
+            reward, done, terminated, truncated, terminal_obs,
+            ep_ret, ep_len,
+        ) = self._step_fn(
+            self.state, self.steps, self._ep_ret, self._ep_len, actions, sub
+        )
+        return StepResult(
+            obs=self.state,
+            reward=reward,
+            done=done,
+            terminated=terminated,
+            truncated=truncated,
+            terminal_obs=terminal_obs,
+            ep_ret=ep_ret,
+            ep_len=ep_len,
+        )

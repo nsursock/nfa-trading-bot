@@ -27,6 +27,9 @@ scripts/
     pendulum.py     Vectorized Pendulum-v1 (exact gym dynamics)
 outputs/            stats_{algo}_{env}.csv written by training runs
 tests/              fast unit / smoke tests (~2 s)
+utils/bench/
+  scale.py          n_envs sweep: env FPS and train FPS
+  solve.py          n_envs sweep: time to solve (gymnasium reward thresholds)
 ```
 
 ## Setup
@@ -78,9 +81,19 @@ actions = agent.predict(env.reset(), deterministic=True)
 
 Both environments reproduce the Gymnasium dynamics exactly and follow SB3
 `VecEnv` semantics: `reset()` returns a `(n_envs, obs_dim)` array,
-`step(actions)` returns `(obs, reward, done, infos)`, finished envs auto-reset,
-and `infos[i]` carries `episode={"r", "l"}`, `terminal_observation` and
-`TimeLimit.truncated` when an episode ends.
+`step(actions)` returns a `StepResult` (`scripts/envs/base.py`), and finished
+envs auto-reset with the pre-reset observation in `terminal_obs`.
+
+| field          | shape          | meaning |
+|----------------|----------------|---------|
+| `obs`          | `(n, obs_dim)` | observation after auto-reset |
+| `reward`       | `(n,)`         | step reward |
+| `done`         | `(n,)`         | `terminated \| truncated` |
+| `terminated`   | `(n,)`         | real termination |
+| `truncated`    | `(n,)`         | time limit hit and not terminated (`TimeLimit.truncated`) |
+| `terminal_obs` | `(n, obs_dim)` | obs before auto-reset (== `obs` where not done) |
+| `ep_ret`       | `(n,)`         | return of the episode that ended this step, 0 elsewhere |
+| `ep_len`       | `(n,)`         | length of that episode, 0 elsewhere |
 
 ## Tests
 
@@ -91,4 +104,33 @@ pytest -q
 The suite covers environment dynamics, config validation / YAML loading, and a
 short smoke run per algorithm (CSV schema, finite values, `predict` shapes).
 Long training runs (scaling with `n_envs`, time to solve) are intentionally
-not part of the test suite.
+not part of the test suite; see `utils/bench/`.
+
+## Benchmarks
+
+```bash
+python -m utils.bench.scale                       # n_envs 32, 64, 128, 3 repeats each
+python -m utils.bench.scale --start 16 --end 256  # geometric sweep (x2 per step)
+python -m utils.bench.scale --n-envs 32 48 64 --algos ppo --seconds 10
+```
+
+`scale.py` runs each configuration in a fresh process, discards
+`--warmup-seconds` (1s default), then measures at least `--seconds` (3s) of
+steady-state training, stopping at complete cycle boundaries. Per
+`(algo, env, n_envs)` it reports `env_fps` (bare `env.step`, one eval per
+step), `train_fps` (median over `--repeats`, with `train_min`/`train_max`),
+`updates/s` and `samples/s` over the same window, `samples/step` (replay
+ratio), and the raw per-repeat details in `bench_scale.trials.jsonl`.
+Hyperparameters scale with `n_envs` (PPO: batch_size; SAC/TD3: replayed
+samples by `--replay-scaling` sqrt, batch capped by `--max-batch-size`);
+`--fixed-hparams` keeps the YAML values.
+
+```bash
+python -m utils.bench.solve                    # time-to-solve, 32/64/128 envs
+python -m utils.bench.solve --budget-mult 4 --seeds 0 1 2
+```
+
+`solve.py` trains until the 100-episode mean return reaches gymnasium's
+`reward_threshold` (CartPole-v1: 475; Pendulum-v1 has none, -200 is used) and
+reports wall time and timesteps to solve, or `solved=no` with the best return
+within the budget. Results go to `outputs/bench_{scale,solve}.csv`.

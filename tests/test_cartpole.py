@@ -11,17 +11,17 @@ def test_cartpole_dynamics():
 
     done_at = None
     for step_i in range(500):
-        obs, reward, done, infos = env.step(mx.ones((3,), dtype=mx.int32))
-        assert reward.shape == (3,)
-        assert bool(mx.all(reward == 1.0))
-        if done_at is None and bool(mx.any(done)):
+        res = env.step(mx.ones((3,), dtype=mx.int32))
+        assert res.reward.shape == (3,)
+        assert bool(mx.all(res.reward == 1.0))
+        if done_at is None and bool(mx.any(res.done)):
             done_at = step_i
-            i = done.tolist().index(True)
-            assert "episode" in infos[i]
-            assert infos[i]["episode"]["l"] == step_i + 1
-            assert infos[i]["terminal_observation"].shape == (4,)
+            i = res.done.tolist().index(True)
+            assert res.ep_len[i].item() == step_i + 1
+            assert res.ep_ret[i].item() == step_i + 1
+            assert res.terminal_obs.shape == (3, 4)
             # auto-reset: obs is fresh, within +-0.05
-            assert bool(mx.all(mx.abs(obs[i]) <= 0.05))
+            assert bool(mx.all(mx.abs(res.obs[i]) <= 0.05))
             break
     assert done_at is not None, "pushing right constantly should terminate"
 
@@ -36,12 +36,13 @@ def test_cartpole_truncation():
         # PD-like bang-bang controller keeps the pole up from the zero state
         theta, theta_dot = env.state[:, 2], env.state[:, 3]
         actions = (theta + 0.5 * theta_dot > 0).astype(mx.int32)
-        obs, reward, done, infos = env.step(actions)
-        if bool(mx.any(done)):
+        res = env.step(actions)
+        if bool(mx.any(res.done)):
             truncated_at = step_i
             for i in range(2):
-                if done.tolist()[i]:
-                    assert infos[i]["TimeLimit.truncated"] is True
-                    assert infos[i]["episode"]["l"] == 500
+                if res.done.tolist()[i]:
+                    assert bool(res.truncated[i]) is True
+                    assert bool(res.terminated[i]) is False
+                    assert res.ep_len[i].item() == 500
             break
     assert truncated_at == 499

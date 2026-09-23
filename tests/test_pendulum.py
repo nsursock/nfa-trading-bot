@@ -18,23 +18,26 @@ def test_pendulum_reward_range():
     env = PendulumEnv(n_envs=8, seed=0)
     env.reset()
     for _ in range(50):
-        _, reward, _, _ = env.step(
+        res = env.step(
             mx.random.uniform(-2.0, 2.0, shape=(8, 1))
         )
-        assert bool(mx.all(reward <= 0.0))
-        assert bool(mx.all(reward >= -16.2736044))
+        assert bool(mx.all(res.reward <= 0.0))
+        assert bool(mx.all(res.reward >= -16.2736044))
 
 
 def test_pendulum_truncation():
     env = PendulumEnv(n_envs=2, seed=0)
     env.reset()
     for step_i in range(200):
-        _, _, done, infos = env.step(mx.zeros((2, 1)))
-        if bool(mx.any(done)):
+        res = env.step(mx.zeros((2, 1)))
+        if bool(mx.any(res.done)):
             assert step_i == 199
             for i in range(2):
-                assert infos[i]["TimeLimit.truncated"] is True
-                assert infos[i]["episode"]["l"] == 200
+                assert bool(res.truncated[i]) is True
+                assert bool(res.terminated[i]) is False
+                assert res.ep_len[i].item() == 200
+                r = res.ep_ret[i].item()
+                assert math.isfinite(r) and r < 0
             # auto-reset: fresh obs consistent + step counter restarted
             assert env.steps.tolist() == [0, 0]
             break
@@ -46,7 +49,7 @@ def test_pendulum_single_step():
     env = PendulumEnv(n_envs=1, seed=0)
     env.reset()
     env.state = mx.array([[0.1, 0.0]])
-    obs, reward, done, infos = env.step(mx.array([[0.0]]))
+    res = env.step(mx.array([[0.0]]))
 
     th, thdot, u = 0.1, 0.0, 0.0
     cost = th**2 + 0.1 * thdot**2 + 0.001 * u**2
@@ -54,9 +57,9 @@ def test_pendulum_single_step():
     newthdot = min(max(newthdot, -8.0), 8.0)
     newth = th + newthdot * 0.05
 
-    o = obs[0].tolist()
+    o = res.obs[0].tolist()
     assert abs(o[0] - math.cos(newth)) < 1e-5
     assert abs(o[1] - math.sin(newth)) < 1e-5
     assert abs(o[2] - newthdot) < 1e-5
-    assert abs(reward[0].item() - (-cost)) < 1e-5
-    assert not bool(done[0])
+    assert abs(res.reward[0].item() - (-cost)) < 1e-5
+    assert not bool(res.done[0])

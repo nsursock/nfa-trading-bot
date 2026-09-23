@@ -4,6 +4,7 @@ import argparse
 import math
 import time
 from collections import deque
+from functools import partial
 from typing import Literal
 
 import mlx.core as mx
@@ -97,14 +98,40 @@ class PPO:
         )
         self.ep_info_buffer = deque(maxlen=config.stats_window_size)
 
+        loss_and_grad = nn.value_and_grad(self.policy, self._loss_and_aux)
+        state = [self.policy.state, self.optimizer.state]
+
+        @partial(mx.compile, inputs=state, outputs=state)
+        def _step(obs, actions, old_logp, adv, returns, old_values):
+            (loss, aux), grads = loss_and_grad(
+                obs, actions, old_logp, adv, returns, old_values
+            )
+            grads, _ = optimizers.clip_grad_norm(grads, self.config.max_grad_norm)
+            self.optimizer.update(self.policy, grads)
+            return mx.stack([loss, *aux])
+
+        self._step = _step
+
+        @partial(
+            mx.compile,
+            inputs=[self.policy.state, mx.random.state],
+            outputs=[self.policy.state, mx.random.state],
+        )
+        def _act(obs):
+            logits = self.policy.logits(obs)
+            actions = mx.random.categorical(logits)
+            logp_all = _log_softmax(logits)
+            logp = mx.take_along_axis(
+                logp_all, actions[:, None], axis=1
+            ).squeeze(-1)
+            values = self.policy.value(obs)
+            return actions, logp, values
+
+        self._act_c = _act
+
     # ---- acting ----
     def _act(self, obs):
-        logits = self.policy.logits(obs)
-        actions = mx.random.categorical(logits)
-        logp_all = _log_softmax(logits)
-        logp = mx.take_along_axis(logp_all, actions[:, None], axis=1).squeeze(-1)
-        values = self.policy.value(obs)
-        return actions, logp, values
+        return self._act_c(obs)
 
     def predict(self, obs, deterministic=True):
         obs = mx.asarray(obs, dtype=mx.float32)
@@ -118,41 +145,46 @@ class PPO:
     # ---- rollout ----
     def _collect_rollout(self, obs, last_done):
         cfg = self.config
-        n_steps, n_envs = cfg.n_steps, self.env.num_envs
-        obs_b = mx.zeros((n_steps, n_envs, self.env.obs_dim))
-        act_b = mx.zeros((n_steps, n_envs), dtype=mx.int32)
-        logp_b = mx.zeros((n_steps, n_envs))
-        val_b = mx.zeros((n_steps, n_envs))
-        rew_b = mx.zeros((n_steps, n_envs))
-        start_b = mx.zeros((n_steps, n_envs))
-        new_eps = []
+        n_steps = cfg.n_steps
+        obs_l, act_l, logp_l, val_l, rew_l, start_l = [], [], [], [], [], []
+        done_l, ep_ret_l, ep_len_l = [], [], []
 
         for t in range(n_steps):
             actions, logp, values = self._act(obs)
-            new_obs, rewards, dones, infos = self.env.step(actions)
+            res = self.env.step(actions)
 
             # bootstrap value of truncated episodes (SB3 behavior)
-            for i, info in enumerate(infos):
-                if "episode" in info:
-                    new_eps.append((info["episode"]["r"], info["episode"]["l"]))
-                    if info.get("TimeLimit.truncated", False):
-                        tv = self.policy.value(info["terminal_observation"][None])
-                        rewards = rewards + mx.where(
-                            mx.arange(n_envs) == i,
-                            cfg.gamma * tv.squeeze(0),
-                            mx.zeros((n_envs,)),
-                        )
+            tv = self.policy.value(res.terminal_obs)
+            rewards = res.reward + cfg.gamma * tv * res.truncated.astype(mx.float32)
 
-            obs_b[t] = obs
-            act_b[t] = actions
-            logp_b[t] = logp
-            val_b[t] = values
-            rew_b[t] = rewards
-            start_b[t] = last_done.astype(mx.float32)
-            obs, last_done = new_obs, dones
+            obs_l.append(obs)
+            act_l.append(actions)
+            logp_l.append(logp)
+            val_l.append(values)
+            rew_l.append(rewards)
+            start_l.append(last_done.astype(mx.float32))
+            done_l.append(res.done)
+            ep_ret_l.append(res.ep_ret)
+            ep_len_l.append(res.ep_len)
+            obs, last_done = res.obs, res.done
 
-        mx.eval(obs_b, act_b, logp_b, val_b, rew_b, start_b)
-        self.ep_info_buffer.extend(new_eps)
+        obs_b, act_b, logp_b, val_b, rew_b, start_b = (
+            mx.stack(lst)
+            for lst in (obs_l, act_l, logp_l, val_l, rew_l, start_l)
+        )
+        done_b = mx.stack(done_l)
+        ep_ret_b = mx.stack(ep_ret_l)
+        ep_len_b = mx.stack(ep_len_l)
+        mx.eval(
+            obs_b, act_b, logp_b, val_b, rew_b, start_b,
+            done_b, ep_ret_b, ep_len_b,
+        )
+        d = done_b.reshape(-1).tolist()
+        r = ep_ret_b.reshape(-1).tolist()
+        l = ep_len_b.reshape(-1).tolist()
+        self.ep_info_buffer.extend(
+            (ri, li) for ri, li, di in zip(r, l, d) if di
+        )
         last_values = self.policy.value(obs)
         return obs, last_done, (obs_b, act_b, logp_b, val_b, rew_b, start_b), last_values
 
@@ -174,15 +206,11 @@ class PPO:
         return adv, adv + val_b
 
     # ---- update ----
-    def _loss(self, policy, obs, actions, old_logp, adv, returns, old_values):
-        return self._loss_and_aux(
-            policy, obs, actions, old_logp, adv, returns, old_values
-        )[0]
-
     def _loss_and_aux(
-        self, policy, obs, actions, old_logp, adv, returns, old_values
+        self, obs, actions, old_logp, adv, returns, old_values
     ):
         cfg = self.config
+        policy = self.policy
         logits = policy.logits(obs)
         logp_all = _log_softmax(logits)
         new_logp = mx.take_along_axis(logp_all, actions[:, None], axis=1).squeeze(-1)
@@ -227,9 +255,8 @@ class PPO:
         logp_f, val_f = flat(logp_b), flat(val_b)
         adv_f, ret_f = flat(adv), flat(returns)
 
-        stats = {k: [] for k in ("loss", "pg", "vf", "ent", "kl", "clip")}
+        outs = []
         n_updates = 0
-        loss_and_grad = nn.value_and_grad(self.policy, self._loss)
         stop = False
         for _ in range(cfg.n_epochs):
             perm = mx.random.permutation(n)
@@ -239,29 +266,26 @@ class PPO:
                     obs_f[idx], act_f[idx], logp_f[idx], adv_f[idx], ret_f[idx],
                     val_f[idx],
                 )
-                loss, grads = loss_and_grad(self.policy, *batch)
-                pg_l, vf_l, ent_l, kl, cf = self._loss_and_aux(
-                    self.policy, *batch
-                )[1]
-                if cfg.target_kl is not None and kl.item() > 1.5 * cfg.target_kl:
-                    stop = True
-                    break
-                grads, _ = optimizers.clip_grad_norm(grads, cfg.max_grad_norm)
-                self.optimizer.update(self.policy, grads)
-                mx.eval(self.policy.parameters(), self.optimizer.state)
-                stats["loss"].append(loss.item())
-                stats["pg"].append(pg_l.item())
-                stats["vf"].append(vf_l.item())
-                stats["ent"].append(ent_l.item())
-                stats["kl"].append(kl.item())
-                stats["clip"].append(cf.item())
+                if cfg.target_kl is not None:
+                    kl = self._loss_and_aux(*batch)[1][3].item()
+                    if kl > 1.5 * cfg.target_kl:
+                        stop = True
+                        break
+                out = self._step(*batch)
+                mx.eval(self.policy.parameters(), self.optimizer.state, out)
+                outs.append(out)
                 n_updates += 1
             if stop:
                 break
-        return {k: (sum(v) / len(v) if v else float("nan")) for k, v in stats.items()}, n_updates
+        keys = ("loss", "pg", "vf", "ent", "kl", "clip")
+        if outs:
+            means = mx.mean(mx.stack(outs), axis=0).tolist()
+        else:
+            means = [float("nan")] * len(keys)
+        return dict(zip(keys, means)), n_updates
 
     # ---- learn ----
-    def learn(self):
+    def learn(self, callback=None):
         cfg = self.config
         header = [
             "time/iterations", "time/total_timesteps", "time/fps",
@@ -280,6 +304,7 @@ class PPO:
         rollout_size = cfg.n_steps * self.env.num_envs
         n_iterations = max(1, cfg.total_timesteps // rollout_size)
         total_ts = 0
+        total_updates = 0
         t0 = time.time()
 
         for it in range(1, n_iterations + 1):
@@ -291,6 +316,7 @@ class PPO:
             )
             train_stats, n_updates = self._update(buffer, adv, returns)
             total_ts += rollout_size
+            total_updates += n_updates
             elapsed = time.time() - t0
             fps = int(total_ts / elapsed) if elapsed > 0 else 0
 
@@ -324,6 +350,9 @@ class PPO:
                 "train/policy_gradient_loss": round(train_stats["pg"], 6),
                 "train/value_loss": round(train_stats["vf"], 6),
             })
+
+            if callback is not None and callback(total_ts, total_updates):
+                break
 
         logger.close()
         return self

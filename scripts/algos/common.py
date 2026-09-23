@@ -96,9 +96,8 @@ class ReplayBuffer:
         self.actions[idx] = action
         self.rewards[idx] = reward.reshape(n, 1)
         self.dones[idx] = done.reshape(n, 1).astype(mx.float32)
+        self.full = self.full or self.pos + n >= self.buffer_size
         self.pos = (self.pos + n) % self.buffer_size
-        if self.pos == 0:
-            self.full = True
 
     def __len__(self):
         return self.buffer_size if self.full else self.pos
@@ -135,6 +134,42 @@ class MLP(nn.Module):
 
     def __call__(self, x):
         return self.net(x)
+
+
+class BatchedLinear(nn.Module):
+    """n independent Linear layers evaluated with one broadcast matmul."""
+
+    def __init__(self, n, in_dim, out_dim):
+        super().__init__()
+        scale = math.sqrt(1.0 / in_dim)  # same init as nn.Linear
+        self.weight = mx.random.uniform(-scale, scale, (n, in_dim, out_dim))
+        self.bias = mx.random.uniform(-scale, scale, (n, 1, out_dim))
+
+    def __call__(self, x):  # x: (n, B, in) or (B, in) broadcast
+        return mx.matmul(x, self.weight) + self.bias
+
+
+class TwinCritics(nn.Module):
+    """Two Q-networks with stacked weights: one kernel per layer instead of two."""
+
+    def __init__(self, obs_dim, action_dim, net_arch, activation="relu"):
+        super().__init__()
+        dims = [obs_dim + action_dim] + list(net_arch) + [1]
+        self.layers = [
+            BatchedLinear(2, dims[i], dims[i + 1])
+            for i in range(len(dims) - 1)
+        ]
+        acts = {"relu": nn.relu, "tanh": nn.tanh}
+        self.act = acts[activation]
+
+    def __call__(self, obs, action):
+        x = mx.concatenate([obs, action], axis=-1)[None]
+        for i, lin in enumerate(self.layers):
+            x = lin(x)
+            if i < len(self.layers) - 1:
+                x = self.act(x)
+        q = x.squeeze(-1)  # (2, B)
+        return q[0], q[1]
 
 
 def orthogonal_init(module, gain):
