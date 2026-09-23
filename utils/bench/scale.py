@@ -21,6 +21,8 @@ Default workload scaling is unchanged: PPO scales batch size with n_envs;
 SAC/TD3 scale replayed samples by sqrt(n_envs), rounded to supported batches
 and integer update counts. --fixed-hparams preserves YAML hyperparameters.
 Neither mode promises linear train FPS or measures GPU utilization.
+For a fixed replay ratio and a fixed transition count, use
+utils.bench.throughput.
 """
 
 import argparse
@@ -243,7 +245,7 @@ def add_ratios(row, previous):
 def format_table(rows, columns=COLUMNS):
     def cell(row, column):
         value = row[column]
-        if column in ("env/train", "train/prev"):
+        if column in ("env/train", "train/prev", "trans/prev"):
             return f"{value:.2f}x" if value != "" else "—"
         return str(value)
 

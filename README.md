@@ -29,6 +29,7 @@ outputs/            stats_{algo}_{env}.csv written by training runs
 tests/              fast unit / smoke tests (~2 s)
 utils/bench/
   scale.py          n_envs sweep: env FPS and train FPS
+  throughput.py     fixed replay ratio: wall time for a fixed transition count
   solve.py          n_envs sweep: time to solve (gymnasium reward thresholds)
 ```
 
@@ -126,6 +127,21 @@ samples by `--replay-scaling` sqrt, batch capped by `--max-batch-size`);
 `--fixed-hparams` keeps the YAML values.
 
 ```bash
+python -m utils.bench.throughput                 # SAC and TD3 at 1024/2048/4096
+python -m utils.bench.throughput --algos td3 --repeats 3
+python -m utils.bench.throughput --algos ppo --timesteps 1048576
+```
+
+`throughput.py` asks how many transitions per second the learner can consume
+when the learning problem does not get easier as `n_envs` grows. Batch size,
+replay buffer, and `learning_starts` stay at the YAML values. SAC/TD3
+`gradient_steps` scales with `n_envs`, so each transition is replayed 256
+times at every width (the YAML ratio). PPO keeps `batch_size`, `n_steps`, and
+`n_epochs`. Every width is timed on the same transition count, after two
+warmup cycles. The default count is eight vector steps of the widest env
+(32768 at 4096); PPO rounds that up to a whole rollout (`n_steps * n_envs`).
+
+```bash
 python -m utils.bench.solve                    # time-to-solve, 32/64/128 envs
 python -m utils.bench.solve --budget-mult 4 --seeds 0 1 2
 ```
@@ -133,4 +149,4 @@ python -m utils.bench.solve --budget-mult 4 --seeds 0 1 2
 `solve.py` trains until the 100-episode mean return reaches gymnasium's
 `reward_threshold` (CartPole-v1: 475; Pendulum-v1 has none, -200 is used) and
 reports wall time and timesteps to solve, or `solved=no` with the best return
-within the budget. Results go to `outputs/bench_{scale,solve}.csv`.
+within the budget. Results go to `outputs/bench_{scale,throughput,solve}.csv`.
