@@ -1,8 +1,9 @@
-# Default HRL training config (not a smoke). Override --pair / --mode / --schedule on the CLI.
+# HRL training config — SAC manager / SAC worker.
+# Override --mode / --schedule on the CLI.
 seed: 0
 verbose: 1
 mode: full
-pair: ppo_sac
+pair: sac_sac
 log_dir: outputs
 ckpt_dir: outputs/ckpts
 stats_window_size: 100

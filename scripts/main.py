@@ -7,7 +7,9 @@ Modes:
 
 Examples:
   python -m scripts.main --config configs/smoke.yaml
-  python -m scripts.main --config configs/smoke.yaml --mode full --pair ppo_sac
+  python -m scripts.main --config configs/config_ppo_sac.yaml
+  python -m scripts.main --config configs/config_ppo_td3.yaml --mode test
+  python -m scripts.main --config configs/config_sac_sac.yaml --schedule alternating
 """
 
 from __future__ import annotations

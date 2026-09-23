@@ -1,0 +1,93 @@
+# HRL training config — PPO manager / SAC worker.
+# Override --mode / --schedule on the CLI.
+seed: 0
+verbose: 1
+mode: full
+pair: ppo_sac
+log_dir: outputs
+ckpt_dir: outputs/ckpts
+stats_window_size: 100
+
+total_timesteps: 50000
+test_episodes: 8
+test_deterministic: false
+test_random_actions: false
+report_per_episode: false
+manager_horizon: 12
+train_schedule: joint
+alt_worker_timesteps: 2048
+alt_manager_timesteps: 1024
+
+manager_net_arch: [64, 64]
+worker_net_arch: [64, 64]
+learning_rate: 3.0e-4
+
+worker_buffer_size: 50000
+worker_learning_starts: 256
+worker_batch_size: 64
+worker_tau: 0.005
+worker_gamma: 0.99
+worker_train_freq: 1
+worker_gradient_steps: 1
+worker_ent_coef: auto
+worker_policy_delay: 2
+worker_target_policy_noise: 0.2
+worker_target_noise_clip: 0.5
+worker_action_noise_std: 0.1
+intrinsic_coef: 0.5
+extrinsic_coef: 1.0
+
+manager_buffer_size: 20000
+manager_learning_starts: 64
+manager_batch_size: 32
+manager_tau: 0.005
+manager_gamma: 0.99
+manager_ent_coef: auto
+
+manager_n_steps: 64
+manager_batch_size_ppo: 64
+manager_n_epochs: 4
+manager_gae_lambda: 0.95
+manager_clip_range: 0.2
+manager_ent_coef_ppo: 0.01
+manager_vf_coef: 0.5
+manager_max_grad_norm: 0.5
+manager_log_std_init: -0.5
+
+env:
+  n_envs: 4
+  n_assets: 2
+  seed: 0
+  low_tf: 5m
+  high_tf: 1h
+  n_low_bars: 512
+  lookback_low: 8
+  lookback_high: 4
+  initial_balance: 10000.0
+  min_leverage: 1.0
+  max_leverage: 20.0
+  min_collateral: 0.02
+  max_collateral: 0.25
+  min_tp: 0.005
+  max_tp: 0.08
+  min_sl: 0.005
+  max_sl: 0.05
+  risk_per_trade: 0.02
+  maintenance_margin: 0.005
+  fee_rate: 0.0004
+  side_deadzone: 0.25
+  liquidation_penalty: 1.0
+  reward_pnl_scale: 1.0
+  reward_dd_penalty: 0.5
+  reward_recovery_bonus: 0.35
+  reward_vol_penalty: 0.05
+  reward_hold_cost: 0.0
+  manager_horizon: 12
+  goal_dim: 4
+  market_mu: 0.0
+  market_sigma: 0.012
+  market_regime: mixed
+  market_dt: 1.0
+  market_n_substeps: 8
+  symbols: [BTCUSDT, ETHUSDT]
+  clock_start: "2024-01-01T00:00:00Z"
