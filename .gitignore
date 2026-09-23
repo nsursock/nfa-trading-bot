@@ -20,4 +20,4 @@ outputs/*
 .vscode/
 
 # Local tool config
-.devin/*.local.json
+.devin/
