@@ -133,6 +133,21 @@ def test_breakdown_has_all_sections(tmp_path: Path):
     assert "BTCUSDT" in text
     assert "ETHUSDT" in text
     assert "long" in text and "short" in text
+    # Single-trade groups can't compute Sharpe / RR without variance or both sides.
+    assert "n/a" in text
+    assert "nan" not in text
+    assert "inf" not in text
+
+
+def test_fmt_num_noncomputable():
+    import math
+
+    from scripts.report import _fmt_num
+
+    assert _fmt_num(math.nan) == "n/a"
+    assert _fmt_num(math.inf) == "n/a"
+    assert _fmt_num(-math.inf) == "n/a"
+    assert _fmt_num(1.2345, 2) == "1.23"
 
 
 def test_equity_curve_is_monotonic(tmp_path: Path):

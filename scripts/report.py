@@ -349,10 +349,8 @@ def _std(xs: list[float]) -> float:
 
 
 def _fmt_num(x: float, digits: int = 2) -> str:
-    if math.isinf(x):
-        return "inf" if x > 0 else "-inf"
-    if math.isnan(x):
-        return "nan"
+    if math.isinf(x) or math.isnan(x):
+        return "n/a"
     return f"{x:.{digits}f}"
 
 
@@ -360,6 +358,7 @@ def _metrics_from_exits(
     exits: list[Trade], initial_balance: float, group: str,
 ) -> GroupStats:
     """Trade-level performance stats for one breakdown group."""
+    nan = float("nan")
     pnls = [float(t.pnl_usdc) for t in exits if t.pnl_usdc is not None]
     pcts = [
         float(t.pnl_pct) / 100.0
@@ -370,17 +369,18 @@ def _metrics_from_exits(
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     net = sum(pnls)
-    avg_win = _mean(wins)
-    avg_loss = _mean(losses)  # ≤ 0
-    win_pct = 100.0 * len(wins) / n if n else 0.0
-    return_pct = 100.0 * net / initial_balance if initial_balance > 1e-12 else 0.0
+    avg_win = _mean(wins) if wins else nan
+    avg_loss = _mean(losses) if losses else nan  # ≤ 0 when defined
+    win_pct = 100.0 * len(wins) / n if n else nan
+    return_pct = (
+        100.0 * net / initial_balance if initial_balance > 1e-12 else nan
+    )
 
     if losses and abs(avg_loss) > 1e-12:
-        risk_reward = avg_win / abs(avg_loss)
-    elif wins and not losses:
-        risk_reward = math.inf
+        risk_reward = avg_win / abs(avg_loss) if wins else nan
     else:
-        risk_reward = 0.0
+        # No losses (or empty): ratio undefined / infinite → n/a in tables.
+        risk_reward = nan
 
     # Equity path over this group's exits (chronological order preserved).
     eq = [float(initial_balance)]
@@ -395,31 +395,30 @@ def _metrics_from_exits(
         rets = [p / initial_balance for p in pnls]
     else:
         rets = []
-    mean_r = _mean(rets)
+    mean_r = _mean(rets) if rets else nan
     std_r = _std(rets)
-    sharpe = (mean_r / std_r) if std_r > 1e-12 else 0.0
+    sharpe = (mean_r / std_r) if std_r > 1e-12 else nan
     down_var = (
         sum(min(r, 0.0) ** 2 for r in rets) / len(rets) if rets else 0.0
     )
     down_std = math.sqrt(down_var)
-    sortino = (mean_r / down_std) if down_std > 1e-12 else 0.0
-    calmar = (return_pct / 100.0 / max_dd) if max_dd > 1e-12 else 0.0
+    sortino = (mean_r / down_std) if down_std > 1e-12 else nan
+    calmar = (return_pct / 100.0 / max_dd) if max_dd > 1e-12 else nan
 
     gross_win = sum(wins)
     gross_loss = abs(sum(losses))
     if gross_loss > 1e-12:
         profit_factor = gross_win / gross_loss
-    elif gross_win > 0:
-        profit_factor = math.inf
     else:
-        profit_factor = 0.0
+        # No losses (or empty): undefined / infinite → n/a in tables.
+        profit_factor = nan
 
     # Martin ratio = return% / Ulcer Index; UI = sqrt(mean(dd%^2)).
     dd_pct = [100.0 * d for d in dd]
     ulcer = (
         math.sqrt(sum(d * d for d in dd_pct) / len(dd_pct)) if dd_pct else 0.0
     )
-    martin = (return_pct / ulcer) if ulcer > 1e-12 else 0.0
+    martin = (return_pct / ulcer) if ulcer > 1e-12 else nan
 
     return GroupStats(
         group=group,
