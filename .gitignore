@@ -11,8 +11,7 @@ __pycache__/
 venv/
 
 # Training artifacts
-outputs/*
-!outputs/.gitkeep
+outputs/
 
 # OS / editors
 .DS_Store
